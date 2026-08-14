@@ -371,7 +371,8 @@ class aggregate_reader_metadata {
     host_span<data_type const> output_dtypes,
     host_span<int const> output_column_schemas,
     std::reference_wrapper<ast::expression const> filter,
-    rmm::cuda_stream_view stream) const;
+    rmm::cuda_stream_view stream,
+    bool* filter_applied = nullptr) const;
 
   /**
    * @brief Filters the row groups using bloom filters

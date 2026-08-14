@@ -43,6 +43,30 @@ namespace {
 
 namespace cg = cooperative_groups;
 
+template <typename T>
+CUDF_HOST_DEVICE constexpr bool is_supported_decimal_storage_type()
+{
+  return cuda::std::is_same_v<T, int32_t> || cuda::std::is_same_v<T, int64_t> ||
+         cuda::std::is_same_v<T, __int128_t>;
+}
+
+template <typename T>
+__device__ T decode_big_endian_signed_integer(uint8_t const* input, cudf::size_type length)
+{
+  using unsigned_type = cuda::std::make_unsigned_t<T>;
+
+  auto value = unsigned_type{};
+  for (auto i = cudf::size_type{0}; i < length; ++i) {
+    value = static_cast<unsigned_type>((value << 8) | input[i]);
+  }
+
+  if (length < static_cast<cudf::size_type>(sizeof(T)) and (input[0] & 0x80) != 0) {
+    value |= ~unsigned_type{} << (length * 8);
+  }
+
+  return static_cast<T>(value);
+}
+
 /// Supported fixed width types for row group pruning using dictionaries
 template <typename T>
 auto constexpr is_supported_fixed_width_type =
@@ -363,7 +387,7 @@ __device__ T decode_fixed_width_value(PageInfo const& page,
   // Check for decimal types
   auto const is_decimal =
     chunk.logical_type.has_value() and chunk.logical_type.value().type == LogicalType::DECIMAL;
-  if (is_decimal and not cudf::is_fixed_point<T>()) {
+  if (is_decimal and not is_supported_decimal_storage_type<T>()) {
     set_error(error, decode_error::INVALID_DATA_TYPE);
     return {};
   }
@@ -400,19 +424,23 @@ __device__ T decode_fixed_width_value(PageInfo const& page,
         set_error(error, decode_error::INVALID_DATA_TYPE);
         return {};
       }
-      // Decode the flba values as string view
-      auto const flba_value = cudf::string_view{
-        reinterpret_cast<char const*>(page_data) + value_idx * flba_length, flba_length};
-      // Copy the flba value including decimal128 (__int128) from the page data
-      cuda::std::memcpy(&decoded_value, flba_value.data(), flba_length);
-
-      // Handle signed integral types
+      auto const value_data = page_data + value_idx * flba_length;
       if constexpr (cudf::is_integral<T>() and cudf::is_signed<T>()) {
-        // Shift the unscaled value up and back down to correctly represent negative numbers.
-        if (flba_length < sizeof(T)) {
-          decoded_value <<= (sizeof(T) - flba_length) * 8;
-          decoded_value >>= (sizeof(T) - flba_length) * 8;
+        if (is_decimal) {
+          decoded_value = decode_big_endian_signed_integer<T>(value_data, flba_length);
+        } else {
+          cuda::std::memcpy(&decoded_value, value_data, flba_length);
+          if (flba_length < sizeof(T)) {
+            decoded_value <<= (sizeof(T) - flba_length) * 8;
+            decoded_value >>= (sizeof(T) - flba_length) * 8;
+          }
         }
+      } else {
+        if (is_decimal) {
+          set_error(error, decode_error::INVALID_DATA_TYPE);
+          return {};
+        }
+        cuda::std::memcpy(&decoded_value, value_data, flba_length);
       }
       break;
     }
@@ -1287,12 +1315,9 @@ struct dictionary_caster {
       // Make sure all literals have the same type as the predicate column
       std::for_each(literals.begin(), literals.end(), [&](auto const& literal) {
         // Check if the literal has the same type as the predicate column
-        CUDF_EXPECTS(
-          dtype == literal->get_data_type() and
-            cudf::have_same_types(
-              cudf::column_view{dtype, 0, {}, {}, 0, 0, {}},
-              cudf::scalar_type_t<T>(T{}, false, stream, cudf::get_current_device_resource_ref())),
-          "Mismatched predicate column and literal types");
+        if (not parquet::detail::literal_matches_dispatched_dtype<T>(dtype, literal)) {
+          throw cudf::logic_error{parquet::detail::literal_type_mismatch_message(dtype, literal)};
+        }
       });
 
       // If there are only a few literals, just evaluate expression while decoding dictionary data

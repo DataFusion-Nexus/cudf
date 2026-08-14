@@ -29,6 +29,7 @@
 #include <cuda/iterator>
 #include <thrust/tabulate.h>
 
+#include <functional>
 #include <future>
 #include <numeric>
 #include <optional>
@@ -79,12 +80,9 @@ struct bloom_filter_caster {
     using word_type         = typename policy_type::word_type;
 
     // Check if the literal has the same type as the predicate column
-    CUDF_EXPECTS(
-      dtype == literal->get_data_type() and
-        cudf::have_same_types(
-          cudf::column_view{dtype, 0, {}, {}, 0, 0, {}},
-          cudf::scalar_type_t<T>(T{}, false, stream, cudf::get_current_device_resource_ref())),
-      "Mismatched predicate column and literal types");
+    if (not parquet::detail::literal_matches_dispatched_dtype<T>(dtype, literal)) {
+      throw cudf::logic_error{parquet::detail::literal_type_mismatch_message(dtype, literal)};
+    }
 
     // Filter properties
     auto constexpr bytes_per_block = sizeof(word_type) * policy_type::words_per_block;

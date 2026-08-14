@@ -13,6 +13,7 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/span.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -53,6 +54,23 @@ struct binary_operands {
   ast::literal const*
     literal;  ///< Reliable only when the expression is of the form `col op lit` or `lit op col`
 };
+
+template <typename T>
+[[nodiscard]] bool literal_matches_dispatched_dtype(data_type dtype, ast::literal const* literal)
+{
+  return dtype == literal->get_data_type() and
+         cudf::type_id_matches_device_storage_type<T>(dtype.id());
+}
+
+[[nodiscard]] inline std::string literal_type_mismatch_message(data_type dtype,
+                                                               ast::literal const* literal)
+{
+  auto const literal_type = literal->get_data_type();
+  return "Mismatched predicate column and literal types: column=" + cudf::type_to_name(dtype) +
+         " scale=" + std::to_string(dtype.scale()) +
+         ", literal=" + cudf::type_to_name(literal_type) +
+         " scale=" + std::to_string(literal_type.scale());
+}
 
 /**
  * @brief Extracts the unary operand from a unary operation

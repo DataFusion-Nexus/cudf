@@ -1612,6 +1612,68 @@ TEST_F(ParquetReaderTest, FilterIdentity)
   CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *result2.tbl);
 }
 
+TEST_F(ParquetReaderTest, FilterBareBooleanColumnReference)
+{
+  auto id   = cudf::test::fixed_width_column_wrapper<int32_t>{1, 2, 3, 4, 5, 6};
+  auto flag = cudf::test::fixed_width_column_wrapper<bool>{true, false, true, false, true, false};
+  auto const written_table = table_view{{id, flag}};
+
+  cudf::io::table_input_metadata metadata(written_table);
+  metadata.column_metadata[0].set_name("id");
+  metadata.column_metadata[1].set_name("flag");
+
+  auto const filepath = temp_env->get_temp_filepath("FilterBareBooleanColumnReference.parquet");
+  cudf::io::parquet_writer_options const write_opts =
+    cudf::io::parquet_writer_options::builder(cudf::io::sink_info{filepath}, written_table)
+      .metadata(std::move(metadata))
+      .row_group_size_rows(2)
+      .stats_level(cudf::io::statistics_freq::STATISTICS_ROWGROUP);
+  cudf::io::write_parquet(write_opts);
+
+  auto filter_expr = cudf::ast::column_reference{1};
+  auto predicate   = cudf::compute_column(written_table, filter_expr);
+  auto expected    = cudf::apply_boolean_mask(written_table, *predicate);
+
+  cudf::io::parquet_reader_options const read_opts =
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath}).filter(filter_expr);
+  auto result = cudf::io::read_parquet(read_opts);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *expected);
+}
+
+TEST_F(ParquetReaderTest, FilterBareBooleanLiteral)
+{
+  auto [src, filepath] = create_parquet_with_stats("FilterBareBooleanLiteral.parquet");
+
+  auto literal_value = cudf::numeric_scalar<bool>(true);
+  auto filter_expr   = cudf::ast::literal(literal_value);
+
+  cudf::io::parquet_reader_options const read_opts =
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath}).filter(filter_expr);
+  auto result = cudf::io::read_parquet(read_opts);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, src);
+  EXPECT_GT(result.metadata.num_input_row_groups, 0);
+  EXPECT_FALSE(result.metadata.num_row_groups_after_stats_filter.has_value());
+}
+
+TEST_F(ParquetReaderTest, FilterBareBooleanFalseLiteral)
+{
+  auto [src, filepath] = create_parquet_with_stats("FilterBareBooleanFalseLiteral.parquet");
+
+  auto literal_value = cudf::numeric_scalar<bool>(false);
+  auto filter_expr   = cudf::ast::literal(literal_value);
+
+  cudf::io::parquet_reader_options const read_opts =
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath}).filter(filter_expr);
+  auto result = cudf::io::read_parquet(read_opts);
+
+  EXPECT_EQ(result.tbl->num_rows(), 0);
+  EXPECT_EQ(result.tbl->num_columns(), src.num_columns());
+  EXPECT_GT(result.metadata.num_input_row_groups, 0);
+  EXPECT_FALSE(result.metadata.num_row_groups_after_stats_filter.has_value());
+}
+
 TEST_F(ParquetReaderTest, FilterWithColumnProjection)
 {
   // col_uint32 (field_id: 10), col_int64 (field_id: 11), col_double (field_id: 12)
@@ -1762,9 +1824,8 @@ TEST_F(ParquetReaderTest, ExtendedFilterExpressions)
       cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath}).filter(filter);
     auto result = cudf::io::read_parquet(read_opts);
     CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *expected);
-    // Stats filter cannot prune row groups
-    EXPECT_EQ(result.metadata.num_row_groups_after_stats_filter.value(),
-              result.metadata.num_input_row_groups);
+    // No StatsAST is produced for a column-to-column comparison.
+    EXPECT_FALSE(result.metadata.num_row_groups_after_stats_filter.has_value());
   }
 
   // Filter: (col_a < 150) and (col_a < col_b)
@@ -1801,7 +1862,7 @@ TEST_F(ParquetReaderTest, ExtendedFilterExpressions)
       cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath}).filter(filter);
     auto result = cudf::io::read_parquet(read_opts);
     CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *expected);
-    // Stats filter cannot prune row groups
+    // The supported branch produces a StatsAST; the unsupported branch is conservatively true.
     EXPECT_EQ(result.metadata.num_row_groups_after_stats_filter.value(),
               result.metadata.num_input_row_groups);
   }
@@ -1850,7 +1911,7 @@ TEST_F(ParquetReaderTest, ExtendedFilterExpressions)
       cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath}).filter(filter);
     auto result = cudf::io::read_parquet(read_opts);
     CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *expected);
-    // Stats filter cannot prune row groups
+    // The supported comparison produces a StatsAST; the false literal is conservatively true.
     EXPECT_EQ(result.metadata.num_row_groups_after_stats_filter.value(),
               result.metadata.num_input_row_groups);
   }
@@ -1869,9 +1930,8 @@ TEST_F(ParquetReaderTest, ExtendedFilterExpressions)
       cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath}).filter(filter);
     auto result = cudf::io::read_parquet(read_opts);
     CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *expected);
-    // Stats filter cannot prune row groups
-    EXPECT_EQ(result.metadata.num_row_groups_after_stats_filter.value(),
-              result.metadata.num_input_row_groups);
+    // No StatsAST is produced for NULL_EQUAL.
+    EXPECT_FALSE(result.metadata.num_row_groups_after_stats_filter.has_value());
   }
 
   // Filter: col_a NULL_EQUAL 10
@@ -1887,9 +1947,8 @@ TEST_F(ParquetReaderTest, ExtendedFilterExpressions)
       cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath}).filter(filter);
     auto result = cudf::io::read_parquet(read_opts);
     CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *expected);
-    // Stats filter cannot prune row groups
-    EXPECT_EQ(result.metadata.num_row_groups_after_stats_filter.value(),
-              result.metadata.num_input_row_groups);
+    // No StatsAST is produced for NULL_EQUAL.
+    EXPECT_FALSE(result.metadata.num_row_groups_after_stats_filter.has_value());
   }
 
   // Filter: NOT(col_a NULL_EQUAL 10) AND (col_a < 50)
@@ -1926,9 +1985,8 @@ TEST_F(ParquetReaderTest, ExtendedFilterExpressions)
       cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath}).filter(filter);
     auto result = cudf::io::read_parquet(read_opts);
     CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *expected);
-    // Stats filter cannot prune row groups
-    EXPECT_EQ(result.metadata.num_row_groups_after_stats_filter.value(),
-              result.metadata.num_input_row_groups);
+    // No StatsAST is produced for a column-to-column comparison.
+    EXPECT_FALSE(result.metadata.num_row_groups_after_stats_filter.has_value());
   }
 }
 

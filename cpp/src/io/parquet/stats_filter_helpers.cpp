@@ -263,9 +263,11 @@ std::reference_wrapper<ast::expression const> stats_expression_converter::visit(
   return _stats_expr.back();
 }
 
-std::reference_wrapper<ast::expression const> stats_expression_converter::get_stats_expr() const
+std::optional<std::reference_wrapper<ast::expression const>>
+stats_expression_converter::get_stats_expr() const
 {
-  return _stats_expr.back();
+  if (_stats_expr.size() == 0) { return std::nullopt; }
+  return std::cref(_stats_expr.back());
 }
 
 }  // namespace cudf::io::parquet::detail

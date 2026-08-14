@@ -572,10 +572,16 @@ struct page_stats_to_row_mask_converter : public page_stats_caster {
       auto constexpr num_columns = 1;
       parquet::detail::stats_expression_converter const stats_expr{
         filter.get(), num_columns, has_is_null_operator, stream};
+      auto const stats_filter = stats_expr.get_stats_expr();
+      if (not stats_filter.has_value()) {
+        auto const scalar_true =
+          cudf::numeric_scalar<bool>(true, true, stream, cudf::get_current_device_resource_ref());
+        return cudf::make_column_from_scalar(scalar_true, total_rows, stream, mr);
+      }
 
       // Filter the input table using AST expression and return the (BOOL8) predicate column.
       auto const page_mask = cudf::detail::compute_column(page_stats_table,
-                                                          stats_expr.get_stats_expr().get(),
+                                                          stats_filter.value().get(),
                                                           stream,
                                                           cudf::get_current_device_resource_ref());
 
@@ -965,10 +971,10 @@ std::unique_ptr<cudf::column> aggregate_reader_metadata::build_row_mask_with_pag
   // Converts AST to StatsAST with reference to min, max columns in above `stats_table`.
   parquet::detail::stats_expression_converter const stats_expr{
     filter.get(), static_cast<size_type>(output_dtypes.size()), has_is_null_operator, stream};
+  auto const stats_filter = stats_expr.get_stats_expr();
 
   // Filter the input table using AST expression and return the (BOOL8) predicate column.
-  return cudf::detail::compute_column(
-    page_stats_table, stats_expr.get_stats_expr().get(), stream, mr);
+  return cudf::detail::compute_column(page_stats_table, stats_filter.value().get(), stream, mr);
 }
 
 template <typename ColumnView>
