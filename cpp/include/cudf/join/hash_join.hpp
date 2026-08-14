@@ -125,6 +125,28 @@ class hash_join {
               cudf::get_current_device_resource_ref());
 
   /**
+   * @brief Returns exact retained device bytes required by hash-join construction.
+   *
+   * The result covers hash-table storage, build table-device-view storage, and sanitized
+   * nullable-string preprocessing retained by the constructor. The call only reads build metadata
+   * and allocates no device memory.
+   *
+   * @throws std::invalid_argument if `build` has no columns, `load_factor` is not in `(0, 1]`, or
+   * the build table contains nested columns.
+   *
+   * @param build The build table that will later be passed to `cudf::hash_join`
+   * @param load_factor The hash-table occupancy ratio in `(0, 1]`
+   * @param stream CUDA stream used to inspect nullable-string metadata
+   * @param mr Device memory resource associated with the eventual build; this call does not
+   * allocate from it
+   */
+  [[nodiscard]] static std::size_t pre_build_reservation_size(
+    cudf::table_view const& build,
+    double load_factor,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+  /**
    * Returns the row indices that can be used to construct the result of performing
    * an inner join between two tables. @see cudf::inner_join(). Behavior is undefined if the
    * provided `output_size` is smaller than the actual output size.

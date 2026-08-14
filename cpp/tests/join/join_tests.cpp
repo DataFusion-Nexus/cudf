@@ -11,6 +11,7 @@
 #include <cudf_test/testing_main.hpp>
 
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
@@ -19,6 +20,7 @@
 #include <cudf/join/join.hpp>
 #include <cudf/join/sort_merge_join.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
@@ -27,8 +29,10 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
+#include <rmm/mr/tracking_resource_adaptor.hpp>
 
 #include <cuco/utility/error.hpp>
 
@@ -38,6 +42,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -51,6 +56,24 @@ using Table                         = cudf::table;
 constexpr cudf::size_type NoneValue = cudf::JoinNoMatch;
 enum class algorithm { HASH, HASH_PARTITIONED, SORT_MERGE, MERGE };
 
+class scoped_current_device_resource {
+ public:
+  explicit scoped_current_device_resource(cuda::mr::any_resource<cuda::mr::device_accessible> mr)
+    : _previous{cudf::set_current_device_resource(std::move(mr))}
+  {
+  }
+
+  ~scoped_current_device_resource() { cudf::set_current_device_resource(std::move(_previous)); }
+
+  scoped_current_device_resource(scoped_current_device_resource const&)            = delete;
+  scoped_current_device_resource(scoped_current_device_resource&&)                 = delete;
+  scoped_current_device_resource& operator=(scoped_current_device_resource const&) = delete;
+  scoped_current_device_resource& operator=(scoped_current_device_resource&&)      = delete;
+
+ private:
+  cuda::mr::any_resource<cuda::mr::device_accessible> _previous;
+};
+
 void expect_match_counts_equal(rmm::device_uvector<cudf::size_type> const& actual_counts,
                                std::vector<cudf::size_type> const& expected_counts,
                                rmm::cuda_stream_view stream)
@@ -62,6 +85,60 @@ void expect_match_counts_equal(rmm::device_uvector<cudf::size_type> const& actua
   EXPECT_TRUE(
     std::equal(host_actual_counts.begin(), host_actual_counts.end(), expected_counts.begin()))
     << "Match counts do not equal expected counts";
+}
+
+std::size_t retained_hash_join_allocation_size(cudf::table_view const& build, double load_factor)
+{
+  auto stream      = cudf::get_default_stream();
+  auto tracking_mr = rmm::mr::tracking_resource_adaptor{
+    cuda::mr::any_resource<cuda::mr::device_accessible>{cudf::get_current_device_resource_ref()}};
+  auto retained_bytes = std::size_t{0};
+
+  {
+    auto hash_join = cudf::hash_join(build,
+                                     cudf::nullable_join::YES,
+                                     cudf::null_equality::EQUAL,
+                                     load_factor,
+                                     stream,
+                                     cuda::mr::any_resource<cuda::mr::device_accessible>{
+                                       tracking_mr});
+    retained_bytes = tracking_mr.get_allocated_bytes();
+  }
+  EXPECT_EQ(0, tracking_mr.get_allocated_bytes());
+
+  return retained_bytes;
+}
+
+template <typename Offset = int32_t>
+std::unique_ptr<cudf::column> make_unsanitized_nullable_strings(
+  std::vector<std::string> const& strings, std::vector<bool> const& validity)
+{
+  CUDF_EXPECTS(strings.size() == validity.size(),
+               "string values and validity must have equal size");
+  CUDF_EXPECTS(
+    strings.size() <= static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()),
+    "too many strings for a test column");
+
+  auto chars   = std::vector<char>{};
+  auto offsets = std::vector<Offset>{Offset{0}};
+  for (auto const& value : strings) {
+    CUDF_EXPECTS(value.size() <= static_cast<std::size_t>(std::numeric_limits<Offset>::max()) -
+                                   static_cast<std::size_t>(offsets.back()),
+                 "test string offsets overflow");
+    chars.insert(chars.end(), value.begin(), value.end());
+    offsets.push_back(static_cast<Offset>(static_cast<std::size_t>(offsets.back()) + value.size()));
+  }
+
+  auto const stream   = cudf::get_default_stream();
+  auto chars_buffer   = rmm::device_buffer{chars.data(), chars.size(), stream};
+  auto offsets_column = column_wrapper<Offset>(offsets.begin(), offsets.end()).release();
+  auto [null_mask, null_count] =
+    cudf::test::detail::make_null_mask(validity.begin(), validity.end());
+  return cudf::make_strings_column(static_cast<cudf::size_type>(strings.size()),
+                                   std::move(offsets_column),
+                                   std::move(chars_buffer),
+                                   null_count,
+                                   std::move(null_mask));
 }
 
 using JoinResult = std::pair<std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
@@ -364,6 +441,158 @@ TEST_F(JoinTest, InvalidLoadFactor)
   // Test load factor > 1
   EXPECT_THROW(cudf::hash_join(t0, cudf::nullable_join::NO, cudf::null_equality::EQUAL, 1.5),
                cuco::logic_error);
+}
+
+TEST_F(JoinTest, HashJoinPreBuildReservationSizeMatchesRetainedAllocations)
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  column_wrapper<int32_t> col0{{3, 1, 2, 0, 3}, {true, false, true, true, true}};
+  strcol_wrapper col1({"s0", "s1", "s2", "s4", "s1"});
+
+  CVector cols;
+  cols.push_back(col0.release());
+  cols.push_back(col1.release());
+  Table build(std::move(cols));
+
+  for (auto load_factor : {0.5, 1.0}) {
+    EXPECT_EQ(cudf::hash_join::pre_build_reservation_size(
+                build.view(), load_factor, stream, mr),
+              retained_hash_join_allocation_size(build.view(), load_factor));
+  }
+
+  CVector nullable_cols;
+  nullable_cols.push_back(make_unsanitized_nullable_strings(
+    {"s0", "s1", "retained-null-payload", "s4", "s1"}, {true, true, false, true, true}));
+  Table nullable_build(std::move(nullable_cols));
+
+  ASSERT_TRUE(cudf::has_nonempty_nulls(nullable_build.view().column(0)));
+  EXPECT_EQ(cudf::hash_join::pre_build_reservation_size(nullable_build.view(), 0.5, stream, mr),
+            retained_hash_join_allocation_size(nullable_build.view(), 0.5));
+}
+
+TEST_F(JoinTest, HashJoinPreBuildReservationSizeMatchesEmptyBuildRows)
+{
+  column_wrapper<int32_t> col0;
+  strcol_wrapper col1;
+
+  CVector cols;
+  cols.push_back(col0.release());
+  cols.push_back(col1.release());
+  Table build(std::move(cols));
+
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  double constexpr load_factor = 0.5;
+  EXPECT_EQ(cudf::hash_join::pre_build_reservation_size(build.view(), load_factor, stream, mr),
+            retained_hash_join_allocation_size(build.view(), load_factor));
+}
+
+TEST_F(JoinTest, HashJoinPreBuildReservationSizeRejectsUnsupportedInputs)
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  {
+    CVector cols;
+    Table build(std::move(cols));
+
+    EXPECT_THROW(static_cast<void>(cudf::hash_join::pre_build_reservation_size(
+                   build.view(), 0.5, stream, mr)),
+                 std::invalid_argument);
+  }
+
+  {
+    column_wrapper<int32_t> col0{{3, 1, 2, 0, 3}};
+    CVector cols;
+    cols.push_back(col0.release());
+    Table build(std::move(cols));
+
+    EXPECT_THROW(static_cast<void>(cudf::hash_join::pre_build_reservation_size(
+                   build.view(), -0.1, stream, mr)),
+                 std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(cudf::hash_join::pre_build_reservation_size(
+                   build.view(), 0.0, stream, mr)),
+                 std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(cudf::hash_join::pre_build_reservation_size(
+                   build.view(), 1.1, stream, mr)),
+                 std::invalid_argument);
+  }
+
+  {
+    auto child = column_wrapper<int32_t>{{3, 1, 2, 0, 3}};
+    auto col0  = cudf::test::structs_column_wrapper{{child}};
+    CVector cols;
+    cols.push_back(col0.release());
+    Table build(std::move(cols));
+
+    EXPECT_THROW(static_cast<void>(cudf::hash_join::pre_build_reservation_size(
+                   build.view(), 0.5, stream, mr)),
+                 std::invalid_argument);
+  }
+}
+
+TEST_F(JoinTest, HashJoinPreBuildReservationSizeDoesNotAllocateNullableStringPayload)
+{
+  CVector cols;
+  cols.push_back(make_unsanitized_nullable_strings({"alpha", "retained-null-payload", "omega"},
+                                                   {true, false, true}));
+  Table build(std::move(cols));
+  ASSERT_TRUE(cudf::has_nonempty_nulls(build.view().column(0)));
+
+  auto stream     = cudf::get_default_stream();
+  auto current_mr = rmm::mr::statistics_resource_adaptor{
+    cuda::mr::any_resource<cuda::mr::device_accessible>{cudf::get_current_device_resource_ref()}};
+  auto target_mr = rmm::mr::statistics_resource_adaptor{
+    cuda::mr::any_resource<cuda::mr::device_accessible>{cudf::get_current_device_resource_ref()}};
+
+  {
+    scoped_current_device_resource resource_scope{
+      cuda::mr::any_resource<cuda::mr::device_accessible>{current_mr}};
+    auto const reservation = cudf::hash_join::pre_build_reservation_size(
+      build.view(), 0.5, stream, rmm::device_async_resource_ref{target_mr});
+    EXPECT_GT(reservation, 0);
+  }
+
+  EXPECT_EQ(current_mr.get_allocations_counter().total, 0);
+  EXPECT_EQ(target_mr.get_allocations_counter().total, 0);
+}
+
+TEST_F(JoinTest,
+       HashJoinPreBuildReservationSizeMatchesSlicedNullableStringAcrossMaskAndMetadataChunks)
+{
+  auto strings   = std::vector<std::string>(4135, "v");
+  auto validity  = std::vector<bool>(strings.size(), true);
+  strings[33]    = "retained-null-before-metadata-chunk";
+  validity[33]   = false;
+  strings[4129]  = "retained-null-after-metadata-chunk";
+  validity[4129] = false;
+  CVector cols;
+  cols.push_back(make_unsanitized_nullable_strings(strings, validity));
+  Table source(std::move(cols));
+  auto const build = cudf::slice(source.view(), {31, 4132}).front();
+
+  ASSERT_GT(build.column(0).offset(), 0);
+  ASSERT_TRUE(cudf::has_nonempty_nulls(build.column(0)));
+  EXPECT_EQ(cudf::hash_join::pre_build_reservation_size(
+              build, 0.5, cudf::get_default_stream(), cudf::get_current_device_resource_ref()),
+            retained_hash_join_allocation_size(build, 0.5));
+}
+
+TEST_F(JoinTest, HashJoinPreBuildReservationSizeMatchesInt64StringOffsetsPreprocessing)
+{
+  CVector cols;
+  cols.push_back(make_unsanitized_nullable_strings<int64_t>(
+    {"alpha", "retained-null-payload", "omega"}, {true, false, true}));
+  Table build(std::move(cols));
+
+  EXPECT_EQ(cudf::strings_column_view{build.view().column(0)}.offsets().type().id(),
+            cudf::type_id::INT64);
+  ASSERT_TRUE(cudf::has_nonempty_nulls(build.view().column(0)));
+  EXPECT_EQ(cudf::hash_join::pre_build_reservation_size(
+              build.view(), 0.5, cudf::get_default_stream(), cudf::get_current_device_resource_ref()),
+            retained_hash_join_allocation_size(build.view(), 0.5));
 }
 
 struct JoinParameterizedTest : public JoinTest, public testing::WithParamInterface<algorithm> {};

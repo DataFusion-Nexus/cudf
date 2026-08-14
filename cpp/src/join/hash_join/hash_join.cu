@@ -14,17 +14,28 @@
 #include <cudf/detail/row_operator/primitive_row_operators.cuh>
 #include <cudf/hashing/detail/murmurhash3_x86_32.cuh>
 #include <cudf/join/hash_join.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/strings/strings_column_view.hpp>
+#include <cudf/strings/utilities.hpp>
+#include <cudf/table/table_device_view.cuh>
 #include <cudf/table/table_view.hpp>
+#include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/type_checks.hpp>
 
 #include <rmm/mr/polymorphic_allocator.hpp>
 
+#include <cuco/storage.cuh>
 #include <cuda/iterator>
+#include <cuda_runtime_api.h>
 
+#include <algorithm>
+#include <array>
+#include <climits>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 namespace cudf::detail {
@@ -59,6 +70,137 @@ void validate_hash_join_probe(table_view const& right, table_view const& left, b
 }
 
 namespace {
+std::size_t checked_add(std::size_t lhs, std::size_t rhs)
+{
+  CUDF_EXPECTS(lhs <= std::numeric_limits<std::size_t>::max() - rhs,
+               "hash join pre-build reservation size overflow",
+               std::overflow_error);
+  return lhs + rhs;
+}
+
+std::size_t checked_mul(std::size_t lhs, std::size_t rhs)
+{
+  CUDF_EXPECTS(rhs == 0 || lhs <= std::numeric_limits<std::size_t>::max() / rhs,
+               "hash join pre-build reservation size overflow",
+               std::overflow_error);
+  return lhs * rhs;
+}
+
+std::size_t hash_join_slot_storage_reservation_size(cudf::size_type rows, double load_factor)
+{
+  using slot_t    = hash_table_t::value_type;
+  using probing_t = hash_table_t::probing_scheme_type;
+  using storage_t = cuco::storage<hash_table_t::bucket_size>;
+
+  auto const extent = cuco::make_valid_extent<probing_t, storage_t>(
+    cuco::extent<std::size_t>{static_cast<std::size_t>(rows)}, load_factor);
+  auto const capacity_slots  = static_cast<std::size_t>(extent);
+  constexpr auto alignment   = hash_table_t::storage_ref_type::alignment;
+  constexpr auto extra_slots = (alignment - 1) / sizeof(slot_t) + 1;
+  return checked_mul(checked_add(capacity_slots, extra_slots), sizeof(slot_t));
+}
+
+std::size_t flat_table_device_view_reservation_size(cudf::table_view const& table)
+{
+  auto view_bytes = std::size_t{0};
+  for (auto const& column : table) {
+    view_bytes = checked_add(view_bytes, cudf::column_device_view::extent(column));
+  }
+  return checked_add(view_bytes, alignof(cudf::column_device_view) - 1);
+}
+
+bool has_unsupported_retained_preprocessing_buffers(cudf::table_view const& table)
+{
+  return cudf::detail::has_nested_columns(table);
+}
+
+template <typename Offset>
+std::size_t flat_string_null_preprocessing_reservation_size(cudf::column_view const& column,
+                                                            rmm::cuda_stream_view stream)
+{
+  constexpr auto metadata_chunk_rows = std::size_t{4096};
+  constexpr auto bits_per_word       = sizeof(cudf::bitmask_type) * CHAR_BIT;
+  constexpr auto max_mask_words = (metadata_chunk_rows + bits_per_word - 1) / bits_per_word + 1;
+  auto host_offsets             = std::array<Offset, metadata_chunk_rows + 1>{};
+  auto host_mask                = std::array<cudf::bitmask_type, max_mask_words>{};
+  auto const offsets            = cudf::strings_column_view{column}.offsets();
+
+  auto valid_chars_bytes = std::size_t{0};
+  auto has_nonempty_null = false;
+  for (auto row_begin = std::size_t{0}; row_begin < static_cast<std::size_t>(column.size());) {
+    auto const chunk_rows =
+      std::min(metadata_chunk_rows, static_cast<std::size_t>(column.size()) - row_begin);
+    auto const absolute_row_begin =
+      checked_add(static_cast<std::size_t>(column.offset()), row_begin);
+    auto const first_mask_word = absolute_row_begin / bits_per_word;
+    auto const end_bit         = checked_add(absolute_row_begin, chunk_rows);
+    auto const mask_word_count = checked_add((end_bit - 1) / bits_per_word, 1) - first_mask_word;
+
+    CUDF_CUDA_TRY(cudaMemcpyAsync(host_offsets.data(),
+                                  offsets.data<Offset>() + absolute_row_begin,
+                                  checked_mul(checked_add(chunk_rows, 1), sizeof(Offset)),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(host_mask.data(),
+                                  column.null_mask() + first_mask_word,
+                                  checked_mul(mask_word_count, sizeof(cudf::bitmask_type)),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    stream.synchronize();
+
+    for (auto row = std::size_t{0}; row < chunk_rows; ++row) {
+      auto const begin = host_offsets[row];
+      auto const end   = host_offsets[row + 1];
+      CUDF_EXPECTS(begin >= 0 && end >= begin,
+                   "invalid string offsets while sizing hash join preprocessing",
+                   std::invalid_argument);
+      auto const row_bytes    = static_cast<std::size_t>(end - begin);
+      auto const absolute_bit = checked_add(absolute_row_begin, row);
+      auto const relative_bit = absolute_bit - first_mask_word * bits_per_word;
+      if (cudf::bit_is_set(host_mask.data(), static_cast<cudf::size_type>(relative_bit))) {
+        valid_chars_bytes = checked_add(valid_chars_bytes, row_bytes);
+      } else {
+        has_nonempty_null = has_nonempty_null || row_bytes != 0;
+      }
+    }
+    row_begin = checked_add(row_begin, chunk_rows);
+  }
+
+  if (!has_nonempty_null) { return 0; }
+
+  auto const offsets_count = checked_add(static_cast<std::size_t>(column.size()), 1);
+  auto const offset_width =
+    valid_chars_bytes >= static_cast<std::size_t>(cudf::strings::get_offset64_threshold())
+      ? sizeof(int64_t)
+      : sizeof(int32_t);
+  auto const offsets_bytes   = checked_mul(offsets_count, offset_width);
+  auto const null_mask_bytes = cudf::bitmask_allocation_size_bytes(column.size());
+  return checked_add(checked_add(offsets_bytes, valid_chars_bytes), null_mask_bytes);
+}
+
+std::size_t flat_null_preprocessing_reservation_size(cudf::table_view const& table,
+                                                     rmm::cuda_stream_view stream)
+{
+  auto bytes = std::size_t{0};
+  for (auto const& column : table) {
+    if (column.type().id() != cudf::type_id::STRING || !column.has_nulls()) { continue; }
+
+    auto const offsets_type = cudf::strings_column_view{column}.offsets().type().id();
+    switch (offsets_type) {
+      case cudf::type_id::INT32:
+        bytes = checked_add(
+          bytes, flat_string_null_preprocessing_reservation_size<int32_t>(column, stream));
+        break;
+      case cudf::type_id::INT64:
+        bytes = checked_add(
+          bytes, flat_string_null_preprocessing_reservation_size<int64_t>(column, stream));
+        break;
+      default: CUDF_FAIL("string offsets must use INT32 or INT64", cudf::data_type_error);
+    }
+  }
+  return bytes;
+}
+
 void build_hash_join(
   cudf::table_view const& right,
   std::shared_ptr<detail::row::equality::preprocessed_table> const& preprocessed_right,
@@ -200,6 +342,29 @@ hash_join::hash_join(cudf::table_view const& right,
   : _impl{std::make_unique<impl_type const>(
       right, has_nulls == nullable_join::YES, compare_nulls, load_factor, stream, std::move(mr))}
 {
+}
+
+std::size_t hash_join::pre_build_reservation_size(cudf::table_view const& build,
+                                                  double load_factor,
+                                                  rmm::cuda_stream_view stream,
+                                                  [[maybe_unused]] rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(0 != build.num_columns(), "Hash join right table is empty", std::invalid_argument);
+  CUDF_EXPECTS(load_factor > 0 && load_factor <= 1,
+               "Invalid load factor: must be greater than 0 and less than or equal to 1.",
+               std::invalid_argument);
+  CUDF_EXPECTS(
+    !cudf::detail::has_unsupported_retained_preprocessing_buffers(build),
+    "hash join pre-build reservation sizing does not yet support nested build-key tables",
+    std::invalid_argument);
+
+  auto const hash_table_bytes =
+    cudf::detail::hash_join_slot_storage_reservation_size(build.num_rows(), load_factor);
+  auto const view_bytes = cudf::detail::flat_table_device_view_reservation_size(build);
+  auto const preprocessing_bytes =
+    cudf::detail::flat_null_preprocessing_reservation_size(build, stream);
+  return cudf::detail::checked_add(cudf::detail::checked_add(hash_table_bytes, view_bytes),
+                                   preprocessing_bytes);
 }
 
 std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
