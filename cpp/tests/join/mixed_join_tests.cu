@@ -6,6 +6,7 @@
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/debug_utilities.hpp>
+#include <cudf_test/memory_resource_utilities.hpp>
 #include <cudf_test/type_lists.hpp>
 
 #include <cudf/ast/expressions.hpp>
@@ -752,6 +753,62 @@ TYPED_TEST(MixedInnerJoinTest, SizeBasedInnerJoinRegression)
 }
 
 using MixedInnerJoinTest2 = MixedInnerJoinTest<int32_t>;
+
+TEST_F(MixedInnerJoinTest2, ExplicitMemoryResourceProvenance)
+{
+  std::vector<int32_t> left_keys{0, 1, 1};
+  std::vector<int32_t> right_keys{0, 1};
+  std::vector<bool> left_key_valid{true, false, true};
+  std::vector<bool> right_key_valid{true, false};
+  cudf::test::fixed_width_column_wrapper<int32_t> left_key{
+    left_keys.begin(), left_keys.end(), left_key_valid.begin()};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_key{
+    right_keys.begin(), right_keys.end(), right_key_valid.begin()};
+  cudf::test::fixed_width_column_wrapper<int32_t> left_condition{10, 20, 30};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_condition{10, 25};
+
+  cudf::table_view left_equality{{left_key}};
+  cudf::table_view right_equality{{right_key}};
+  cudf::table_view left_conditional{{left_condition}};
+  cudf::table_view right_conditional{{right_condition}};
+
+  auto const left_ref  = cudf::ast::column_reference(0, cudf::ast::table_reference::LEFT);
+  auto const right_ref = cudf::ast::column_reference(0, cudf::ast::table_reference::RIGHT);
+  auto const predicate = cudf::ast::operation(cudf::ast::ast_operator::EQUAL, left_ref, right_ref);
+  auto const stream   = cudf::get_default_stream();
+
+  auto ambient_mr = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  auto supplied_mr = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  PairJoinReturn result;
+  {
+    cudf::test::scoped_current_device_resource current_scope{ambient_mr};
+    result = cudf::mixed_inner_join(left_equality,
+                                    right_equality,
+                                    left_conditional,
+                                    right_conditional,
+                                    predicate,
+                                    cudf::null_equality::EQUAL,
+                                    {},
+                                    stream,
+                                    rmm::device_async_resource_ref{supplied_mr});
+    stream.synchronize();
+
+    EXPECT_EQ(ambient_mr.get_bytes_counter().total, 0);
+    EXPECT_GT(supplied_mr.get_bytes_counter().total, 0);
+    EXPECT_GT(supplied_mr.get_bytes_counter().value, 0);
+    ASSERT_EQ(result.first->size(), 1);
+    ASSERT_EQ(result.second->size(), 1);
+    EXPECT_EQ(result.first->element(0, stream), 0);
+    EXPECT_EQ(result.second->element(0, stream), 0);
+  }
+
+  result.first.reset();
+  result.second.reset();
+  stream.synchronize();
+  EXPECT_EQ(ambient_mr.get_bytes_counter().value, 0);
+  EXPECT_EQ(supplied_mr.get_bytes_counter().value, 0);
+}
+
 TEST_F(MixedInnerJoinTest2, UnaryRightTableColumnReference)
 {
   using TypeParam            = int32_t;

@@ -127,10 +127,11 @@ hash_join<Hasher>::hash_join(cudf::table_view const& right,
       {},
       {},
       {},
-      rmm::mr::polymorphic_allocator<char>{std::move(mr)},
+      rmm::mr::polymorphic_allocator<char>{mr},
       stream.value()}})},
     _right{right},
-    _preprocessed_right{cudf::detail::row::equality::preprocessed_table::create(_right, stream)}
+    _preprocessed_right{cudf::detail::row::equality::preprocessed_table::create(
+      _right, stream, rmm::device_async_resource_ref{mr})}
 {
   CUDF_FUNC_RANGE();
   CUDF_EXPECTS(0 != right.num_columns(), "Hash join right table is empty", std::invalid_argument);
@@ -141,7 +142,7 @@ hash_join<Hasher>::hash_join(cudf::table_view const& right,
   if (_is_empty) { return; }
 
   auto const row_bitmask =
-    cudf::detail::bitmask_and(right, stream, cudf::get_current_device_resource_ref()).first;
+    cudf::detail::bitmask_and(right, stream, rmm::device_async_resource_ref{mr}).first;
   cudf::detail::build_hash_join(_right,
                                 _preprocessed_right,
                                 _impl->_hash_table,

@@ -601,7 +601,8 @@ cudf::size_type inplace_bitmask_and(device_span<bitmask_type> dest_mask,
     masks,
     begin_bits,
     mask_size,
-    stream);
+    stream,
+    cudf::get_current_device_resource_ref());
 }
 
 // Bitwise AND of the masks

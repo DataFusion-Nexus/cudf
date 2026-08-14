@@ -106,7 +106,11 @@ mixed_join(table_view const& left_equality,
       std::move(left_outer), left_conditional.num_rows(), right_conditional.num_rows(), stream, mr);
   }
 
-  auto const hash_joiner = cudf::hash_join{right_equality, compare_nulls, stream};
+  auto const hash_joiner = cudf::hash_join{
+    right_equality,
+    compare_nulls,
+    stream,
+    cuda::mr::any_resource<cuda::mr::device_accessible>{mr}};
   auto const [left_indices, right_indices] =
     equality_join_indices(hash_joiner, left_equality, join_type, stream, mr);
 
@@ -153,7 +157,7 @@ compute_mixed_join_output_size(table_view const& left_equality,
       auto counts =
         rmm::device_uvector<size_type>(static_cast<std::size_t>(left_num_rows), stream, mr);
       thrust::uninitialized_fill(
-        rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+        rmm::exec_policy_nosync(stream, mr),
         counts.begin(),
         counts.end(),
         size_type{1});
@@ -163,7 +167,11 @@ compute_mixed_join_output_size(table_view const& left_equality,
     return {0, std::make_unique<rmm::device_uvector<size_type>>(0, stream, mr)};
   }
 
-  auto const hash_joiner = cudf::hash_join{right_equality, compare_nulls, stream};
+  auto const hash_joiner = cudf::hash_join{
+    right_equality,
+    compare_nulls,
+    stream,
+    cuda::mr::any_resource<cuda::mr::device_accessible>{mr}};
   auto const [left_indices, right_indices] =
     equality_join_indices(hash_joiner, left_equality, join_type, stream, mr);
 

@@ -175,7 +175,7 @@ hash_join<Hasher>::join_retrieve(cudf::table_view const& left,
   }
 
   auto const preprocessed_left =
-    cudf::detail::row::equality::preprocessed_table::create(left, stream);
+    cudf::detail::row::equality::preprocessed_table::create(left, stream, mr);
 
   auto join_indices = cudf::detail::probe_join_hash_table<Join>(_right,
                                                                 left,

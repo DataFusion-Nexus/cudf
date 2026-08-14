@@ -12,6 +12,7 @@
 #include <rmm/device_uvector.hpp>
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace CUDF_EXPORT cudf {
@@ -47,10 +48,13 @@ struct preprocessed_table {
    *
    * @param table The table to preprocess
    * @param stream The cuda stream to use while preprocessing.
+   * @param mr Device memory resource used for preprocessing state.
    * @return A preprocessed table as shared pointer
    */
-  static std::shared_ptr<preprocessed_table> create(table_view const& table,
-                                                    rmm::cuda_stream_view stream);
+  static std::shared_ptr<preprocessed_table> create(
+    table_view const& table,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /**
    * @brief Implicit conversion operator to a `table_device_view` of the preprocessed table.
@@ -69,7 +73,9 @@ struct preprocessed_table {
   friend class ::cudf::detail::row::primitive::row_hasher;
 
   using table_device_view_owner =
-    std::invoke_result_t<decltype(table_device_view::create), table_view, rmm::cuda_stream_view>;
+    decltype(table_device_view::create(std::declval<table_view>(),
+                                       std::declval<rmm::cuda_stream_view>(),
+                                       std::declval<rmm::device_async_resource_ref>()));
 
   preprocessed_table(table_device_view_owner&& table,
                      std::vector<rmm::device_buffer>&& null_buffers,

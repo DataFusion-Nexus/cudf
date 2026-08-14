@@ -31,6 +31,7 @@
 
 #include <memory>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace CUDF_EXPORT cudf {
@@ -678,7 +679,9 @@ struct less_equivalent_comparator
  */
 struct preprocessed_table {
   using table_device_view_owner =
-    std::invoke_result_t<decltype(table_device_view::create), table_view, rmm::cuda_stream_view>;
+    decltype(table_device_view::create(std::declval<table_view>(),
+                                       std::declval<rmm::cuda_stream_view>(),
+                                       std::declval<rmm::device_async_resource_ref>()));
 
   /**
    * @brief Preprocess table for use with lexicographical comparison

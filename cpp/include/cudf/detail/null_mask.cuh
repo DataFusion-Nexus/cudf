@@ -231,7 +231,8 @@ size_type inplace_bitmask_binop(Binop op,
                                 host_span<bitmask_type const* const> masks,
                                 host_span<size_type const> masks_begin_bits,
                                 size_type mask_size_bits,
-                                rmm::cuda_stream_view stream);
+                                rmm::cuda_stream_view stream,
+                                rmm::device_async_resource_ref mr);
 
 template <typename Binop>
 rmm::device_uvector<size_type> inplace_segmented_bitmask_binop(
@@ -268,7 +269,8 @@ std::pair<rmm::device_buffer, size_type> bitmask_binop(Binop op,
                           masks,
                           masks_begin_bits,
                           mask_size_bits,
-                          stream);
+                          stream,
+                          mr);
 
   return std::pair(std::move(dest_mask), null_count);
 }
@@ -304,7 +306,7 @@ segmented_bitmask_binop(Binop op,
       static_cast<bitmask_type*>(h_destination_masks.back()->data()));
   }
   auto destination_masks = cudf::detail::make_device_uvector_async(
-    h_destination_masks_ptrs, stream, cudf::get_current_device_resource_ref());
+    h_destination_masks_ptrs, stream, mr);
 
   // for destination size, pass number of words in each destination buffer instead of number of bits
   auto null_counts = inplace_segmented_bitmask_binop(op,
@@ -315,7 +317,7 @@ segmented_bitmask_binop(Binop op,
                                                      mask_size_bits,
                                                      segment_offsets,
                                                      stream,
-                                                     cudf::get_current_device_resource_ref());
+                                                     mr);
 
   return std::pair(std::move(h_destination_masks),
                    cudf::detail::make_std_vector<size_type>(null_counts, stream));
@@ -339,7 +341,8 @@ size_type inplace_bitmask_binop(Binop op,
                                 host_span<bitmask_type const* const> masks,
                                 host_span<size_type const> masks_begin_bits,
                                 size_type mask_size_bits,
-                                rmm::cuda_stream_view stream)
+                                rmm::cuda_stream_view stream,
+                                rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(
     std::all_of(masks_begin_bits.begin(), masks_begin_bits.end(), [](auto b) { return b >= 0; }),
@@ -348,7 +351,6 @@ size_type inplace_bitmask_binop(Binop op,
   CUDF_EXPECTS(std::all_of(masks.begin(), masks.end(), [](auto p) { return p != nullptr; }),
                "Mask pointer cannot be null");
 
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref();
   cudf::detail::device_scalar<size_type> d_counter{0, stream, mr};
 
   auto d_masks      = cudf::detail::make_device_uvector_async(masks, stream, mr);
@@ -405,11 +407,10 @@ rmm::device_uvector<size_type> inplace_segmented_bitmask_binop(
                "At least one segment needs to be passed for bitwise operations");
 
   rmm::device_uvector<size_type> d_null_counts(segment_offsets.size() - 1, stream, mr);
-  auto temp_mr      = cudf::get_current_device_resource_ref();
-  auto d_masks      = cudf::detail::make_device_uvector_async(masks, stream, temp_mr);
-  auto d_begin_bits = cudf::detail::make_device_uvector_async(masks_begin_bits, stream, temp_mr);
+  auto d_masks      = cudf::detail::make_device_uvector_async(masks, stream, mr);
+  auto d_begin_bits = cudf::detail::make_device_uvector_async(masks_begin_bits, stream, mr);
   auto d_segment_offsets =
-    cudf::detail::make_device_uvector_async(segment_offsets, stream, temp_mr);
+    cudf::detail::make_device_uvector_async(segment_offsets, stream, mr);
 
   auto constexpr block_size = 256;
   auto constexpr warps_per_block =
@@ -535,7 +536,7 @@ rmm::device_uvector<size_type> segmented_count_bits(bitmask_type const* bitmask,
 {
   auto const num_ranges =
     static_cast<size_type>(std::distance(first_bit_indices_begin, first_bit_indices_end));
-  rmm::device_uvector<size_type> d_bit_counts(num_ranges, stream);
+  rmm::device_uvector<size_type> d_bit_counts(num_ranges, stream, mr);
 
   auto num_set_bits_in_word = thrust::make_transform_iterator(bitmask, popcount{});
   auto first_word_indices =
@@ -553,7 +554,7 @@ rmm::device_uvector<size_type> segmented_count_bits(bitmask_type const* bitmask,
                                                 first_word_indices,
                                                 last_word_indices,
                                                 stream.value()));
-  rmm::device_buffer d_temp_storage(temp_storage_bytes, stream);
+  rmm::device_buffer d_temp_storage(temp_storage_bytes, stream, mr);
 
   // Perform segmented reduction.
   CUDF_CUDA_TRY(cub::DeviceSegmentedReduce::Sum(d_temp_storage.data(),
@@ -585,7 +586,7 @@ rmm::device_uvector<size_type> segmented_count_bits(bitmask_type const* bitmask,
         auto const end   = cuda::std::get<1>(segment);
         return end - begin;
       }));
-    thrust::transform(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+    thrust::transform(rmm::exec_policy_nosync(stream, mr),
                       segment_length_iterator,
                       segment_length_iterator + num_ranges,
                       d_bit_counts.data(),
@@ -669,7 +670,9 @@ std::vector<size_type> segmented_count_bits(bitmask_type const* bitmask,
                                             IndexIterator indices_begin,
                                             IndexIterator indices_end,
                                             count_bits_policy count_bits,
-                                            rmm::cuda_stream_view stream)
+                                            rmm::cuda_stream_view stream,
+                                            rmm::device_async_resource_ref mr =
+                                              cudf::get_current_device_resource_ref())
 {
   CUDF_EXPECTS(bitmask != nullptr, "Invalid bitmask.");
   auto const num_segments = validate_segmented_indices(indices_begin, indices_end);
@@ -682,7 +685,7 @@ std::vector<size_type> segmented_count_bits(bitmask_type const* bitmask,
     std::distance(indices_begin, indices_end), stream);
   std::copy(indices_begin, indices_end, std::back_inserter(h_indices));
   auto const d_indices =
-    make_device_uvector_async(h_indices, stream, cudf::get_current_device_resource_ref());
+    make_device_uvector_async(h_indices, stream, mr);
 
   // Compute the bit counts over each segment.
   auto first_bit_indices_begin = thrust::make_transform_iterator(
@@ -697,7 +700,7 @@ std::vector<size_type> segmented_count_bits(bitmask_type const* bitmask,
                                        last_bit_indices_begin,
                                        count_bits,
                                        stream,
-                                       cudf::get_current_device_resource_ref());
+                                       mr);
 
   // Copy the results back to the host.
   return make_std_vector(d_bit_counts, stream);
@@ -708,10 +711,12 @@ template <typename IndexIterator>
 std::vector<size_type> segmented_count_set_bits(bitmask_type const* bitmask,
                                                 IndexIterator indices_begin,
                                                 IndexIterator indices_end,
-                                                rmm::cuda_stream_view stream)
+                                                rmm::cuda_stream_view stream,
+                                                rmm::device_async_resource_ref mr =
+                                                  cudf::get_current_device_resource_ref())
 {
   return detail::segmented_count_bits(
-    bitmask, indices_begin, indices_end, count_bits_policy::SET_BITS, stream);
+    bitmask, indices_begin, indices_end, count_bits_policy::SET_BITS, stream, mr);
 }
 
 // Count zero bits in the specified ranges.
@@ -719,10 +724,12 @@ template <typename IndexIterator>
 std::vector<size_type> segmented_count_unset_bits(bitmask_type const* bitmask,
                                                   IndexIterator indices_begin,
                                                   IndexIterator indices_end,
-                                                  rmm::cuda_stream_view stream)
+                                                  rmm::cuda_stream_view stream,
+                                                  rmm::device_async_resource_ref mr =
+                                                    cudf::get_current_device_resource_ref())
 {
   return detail::segmented_count_bits(
-    bitmask, indices_begin, indices_end, count_bits_policy::UNSET_BITS, stream);
+    bitmask, indices_begin, indices_end, count_bits_policy::UNSET_BITS, stream, mr);
 }
 
 // Count valid elements in the specified ranges of a validity bitmask.
@@ -730,7 +737,9 @@ template <typename IndexIterator>
 std::vector<size_type> segmented_valid_count(bitmask_type const* bitmask,
                                              IndexIterator indices_begin,
                                              IndexIterator indices_end,
-                                             rmm::cuda_stream_view stream)
+                                             rmm::cuda_stream_view stream,
+                                             rmm::device_async_resource_ref mr =
+                                               cudf::get_current_device_resource_ref())
 {
   if (bitmask == nullptr) {
     // Return a vector of segment lengths.
@@ -742,7 +751,7 @@ std::vector<size_type> segmented_valid_count(bitmask_type const* bitmask,
     return ret;
   }
 
-  return detail::segmented_count_set_bits(bitmask, indices_begin, indices_end, stream);
+  return detail::segmented_count_set_bits(bitmask, indices_begin, indices_end, stream, mr);
 }
 
 // Count null elements in the specified ranges of a validity bitmask.
@@ -750,14 +759,16 @@ template <typename IndexIterator>
 std::vector<size_type> segmented_null_count(bitmask_type const* bitmask,
                                             IndexIterator indices_begin,
                                             IndexIterator indices_end,
-                                            rmm::cuda_stream_view stream)
+                                            rmm::cuda_stream_view stream,
+                                            rmm::device_async_resource_ref mr =
+                                              cudf::get_current_device_resource_ref())
 {
   if (bitmask == nullptr) {
     // Return a vector of zeros.
     auto const num_segments = validate_segmented_indices(indices_begin, indices_end);
     return std::vector<size_type>(num_segments, 0);
   }
-  return detail::segmented_count_unset_bits(bitmask, indices_begin, indices_end, stream);
+  return detail::segmented_count_unset_bits(bitmask, indices_begin, indices_end, stream, mr);
 }
 
 /**
@@ -826,7 +837,7 @@ std::pair<rmm::device_buffer, size_type> segmented_null_mask_reduction(
                                        last_bit_indices_begin,
                                        cudf::detail::count_bits_policy::SET_BITS,
                                        stream,
-                                       cudf::get_current_device_resource_ref());
+                                       mr);
   auto const length_and_valid_count =
     thrust::make_zip_iterator(segment_length_iterator, segment_valid_counts.begin());
   return cudf::detail::valid_if(

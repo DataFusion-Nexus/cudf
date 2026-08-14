@@ -155,7 +155,8 @@ void copy_if_async(InputIterator begin,
                    InputIterator end,
                    OutputIterator output,
                    Predicate predicate,
-                   rmm::cuda_stream_view stream)
+                   rmm::cuda_stream_view stream,
+                   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
 {
   auto const num_items = cuda::std::distance(begin, end);
 
@@ -164,7 +165,7 @@ void copy_if_async(InputIterator begin,
   CUDF_CUDA_TRY(cub::DeviceSelect::If(
     nullptr, tmp_bytes, begin, output, no_out, num_items, predicate, stream.value()));
 
-  auto tmp_stg = rmm::device_buffer(tmp_bytes, stream, cudf::get_current_device_resource_ref());
+  auto tmp_stg = rmm::device_buffer(tmp_bytes, stream, mr);
   CUDF_CUDA_TRY(cub::DeviceSelect::If(
     tmp_stg.data(), tmp_bytes, begin, output, no_out, num_items, predicate, stream.value()));
 }
@@ -185,7 +186,8 @@ void copy_if_async(InputIterator begin,
                    StencilIterator stencil,
                    OutputIterator result,
                    Predicate predicate,
-                   rmm::cuda_stream_view stream)
+                   rmm::cuda_stream_view stream,
+                   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
 {
   auto const num_items = cuda::std::distance(begin, end);
 
@@ -194,7 +196,7 @@ void copy_if_async(InputIterator begin,
   CUDF_CUDA_TRY(cub::DeviceSelect::FlaggedIf(
     nullptr, tmp_bytes, begin, stencil, result, no_out, num_items, predicate, stream.value()));
 
-  auto tmp = rmm::device_buffer(tmp_bytes, stream, cudf::get_current_device_resource_ref());
+  auto tmp = rmm::device_buffer(tmp_bytes, stream, mr);
   CUDF_CUDA_TRY(cub::DeviceSelect::FlaggedIf(
     tmp.data(), tmp_bytes, begin, stencil, result, no_out, num_items, predicate, stream.value()));
 }
