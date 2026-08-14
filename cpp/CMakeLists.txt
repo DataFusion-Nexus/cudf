@@ -68,6 +68,16 @@ set(CUDF_BUILD_STATIC_DEPS
 )
 set_property(CACHE CUDF_BUILD_STATIC_DEPS PROPERTY STRINGS "ON" "OFF" "FORCE")
 
+option(
+  CUDF_RMM_BUILD_SHARED
+  "Build and install RMM as a shared library when other dependencies are static"
+  ON
+)
+set(CUDF_RMM_BUILD_SHARED_EFFECTIVE ${CUDF_RMM_BUILD_SHARED})
+if(CUDF_BUILD_STATIC_DEPS STREQUAL "FORCE")
+  set(CUDF_RMM_BUILD_SHARED_EFFECTIVE OFF)
+endif()
+
 # cudart can be statically linked or dynamically linked. The python ecosystem wants dynamic linking
 option(CUDA_STATIC_RUNTIME "Statically link the CUDA runtime" OFF)
 # FORCE mode implies static CUDA runtime
@@ -351,8 +361,12 @@ rapids_cpm_init()
 
 include(${rapids-cmake-dir}/cpm/rapids_logger.cmake)
 set(_rapids_logger_args)
+set(_rapids_logger_exclude_flag ${CUDF_EXCLUDE_DEPS_FROM_ALL_FLAG})
+if(CUDF_RMM_BUILD_SHARED_EFFECTIVE)
+  set(_rapids_logger_exclude_flag)
+endif()
 if(NOT CUDF_BUILD_STATIC_DEPS STREQUAL "OFF")
-  list(APPEND _rapids_logger_args ${CUDF_EXCLUDE_DEPS_FROM_ALL_FLAG} CPM_ARGS OPTIONS
+  list(APPEND _rapids_logger_args ${_rapids_logger_exclude_flag} CPM_ARGS OPTIONS
        "BUILD_SHARED_LIBS OFF"
   )
 endif()

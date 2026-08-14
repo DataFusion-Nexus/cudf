@@ -14,10 +14,12 @@ function(find_and_configure_nvtx)
   # NOT being absorbed — when absorbed, we bundle nvtx3 headers directly and consumers don't need
   # find_dependency(nvtx3).
   set(_nvtx_args BUILD_EXPORT_SET cudf-exports)
-  if(CUDF_INSTALL_LIBRARY_DEPS)
+  set(_nvtx_exclude_flag ${CUDF_EXCLUDE_DEPS_FROM_ALL_FLAG})
+  if(CUDF_INSTALL_LIBRARY_DEPS OR CUDF_RMM_BUILD_SHARED_EFFECTIVE)
     list(APPEND _nvtx_args INSTALL_EXPORT_SET cudf-exports)
+    set(_nvtx_exclude_flag)
   endif()
-  rapids_cpm_nvtx3(${_nvtx_args} ${CUDF_EXCLUDE_DEPS_FROM_ALL_FLAG})
+  rapids_cpm_nvtx3(${_nvtx_args} ${_nvtx_exclude_flag})
 endfunction()
 
 find_and_configure_nvtx()
