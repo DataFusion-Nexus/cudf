@@ -15,6 +15,7 @@
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cuda/iterator>
 #include <cuda/std/utility>
@@ -503,6 +504,19 @@ class alignas(16) column_device_view : public column_device_view_core {
    */
   static std::unique_ptr<column_device_view, std::function<void(column_device_view*)>> create(
     column_view source_view, rmm::cuda_stream_view stream = cudf::get_default_stream());
+
+  /**
+   * @brief Construct a device column view using an explicit memory resource.
+   *
+   * @param source_view The column view to make usable in device code
+   * @param stream CUDA stream used for device memory operations
+   * @param mr Device memory resource used for descendant storage
+   * @return A device column view owner
+   */
+  static std::unique_ptr<column_device_view, std::function<void(column_device_view*)>>
+  create_with_mr(column_view source_view,
+                 rmm::cuda_stream_view stream,
+                 rmm::device_async_resource_ref mr);
 
   /**
    * @brief Destroy the `column_device_view` object.

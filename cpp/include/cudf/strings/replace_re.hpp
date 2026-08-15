@@ -10,6 +10,7 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <cstddef>
 #include <optional>
 
 /**
@@ -77,6 +78,64 @@ std::unique_ptr<column> replace_with_backrefs(
   std::string_view replacement,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief Exact output and temporary workspace facts for prepared back-reference replacement.
+ */
+void replace_with_backrefs_output_size(strings_column_view const& input,
+                                       regex_program const& prog,
+                                       std::string_view replacement,
+                                       std::size_t& retained_output_bytes,
+                                       std::size_t& temporary_workspace_bytes,
+                                       rmm::cuda_stream_view stream,
+                                       rmm::device_async_resource_ref mr);
+
+/**
+ * @brief Opaque prepared replace-with-backrefs state.
+ *
+ * The input is borrowed until the state is destroyed or consumed. Preparation performs the size
+ * pass and retains the offsets; execution consumes the state and performs only the write pass.
+ */
+struct replace_with_backrefs_prepared;
+
+/**
+ * @brief Exact facts published by a prepared replace-with-backrefs state.
+ */
+struct replace_with_backrefs_prepared_output_size_facts {
+  std::size_t retained_output_bytes{0};
+  std::size_t retained_state_bytes{0};
+  std::size_t peak_execute_workspace_bytes{0};
+  std::size_t execute_reservation_required_bytes{0};
+};
+
+/**
+ * @brief Prepare replace-with-backrefs state after one size pass.
+ */
+replace_with_backrefs_prepared* prepare_replace_with_backrefs(strings_column_view const& input,
+                                                              regex_program const& prog,
+                                                              std::string_view replacement,
+                                                              rmm::cuda_stream_view stream,
+                                                              rmm::device_async_resource_ref mr);
+
+/**
+ * @brief Read output, retained-state, and execute-workspace facts from prepared state.
+ */
+replace_with_backrefs_prepared_output_size_facts
+get_replace_with_backrefs_prepared_output_size_facts(
+  replace_with_backrefs_prepared const& prepared);
+
+/**
+ * @brief Consume prepared state and run only the write pass.
+ */
+std::unique_ptr<column> execute_replace_with_backrefs(strings_column_view const& input,
+                                                      replace_with_backrefs_prepared* prepared,
+                                                      rmm::cuda_stream_view stream,
+                                                      rmm::device_async_resource_ref mr);
+
+/**
+ * @brief Destroy unused prepared replace-with-backrefs state.
+ */
+void destroy_replace_with_backrefs_prepared(replace_with_backrefs_prepared* prepared);
 
 }  // namespace strings
 }  // namespace CUDF_EXPORT cudf

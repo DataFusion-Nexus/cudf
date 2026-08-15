@@ -9,10 +9,14 @@
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/iterator_utilities.hpp>
+#include <cudf_test/memory_resource_utilities.hpp>
 
 #include <cudf/strings/regex/regex_program.hpp>
 #include <cudf/strings/replace_re.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+
+#include <rmm/cuda_stream.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include <thrust/iterator/transform_iterator.h>
 
@@ -21,6 +25,8 @@
 #include <vector>
 
 struct StringsReplaceRegexTest : public cudf::test::BaseFixture {};
+
+using cudf::test::scoped_current_device_resource;
 
 TEST_F(StringsReplaceRegexTest, ReplaceRegexTest)
 {
@@ -408,6 +414,129 @@ TEST_F(StringsReplaceRegexTest, ReplaceBackrefsRegexErrorTest)
   EXPECT_THROW(cudf::strings::replace_with_backrefs(view, *prog, "\\1"), cudf::logic_error);
   prog = cudf::strings::regex_program::create("(\\w)");
   EXPECT_THROW(cudf::strings::replace_with_backrefs(view, *prog, ""), cudf::logic_error);
+}
+
+TEST_F(StringsReplaceRegexTest, PreparedBackrefsRejectsDifferentInput)
+{
+  cudf::test::strings_column_wrapper input({"abc-123", "def-456"});
+  cudf::test::strings_column_wrapper other({"a-much-longer-value-123", "different-456"});
+  auto prog = cudf::strings::regex_program::create("([a-z]+)-(\\d+)");
+
+  auto* prepared =
+    cudf::strings::prepare_replace_with_backrefs(cudf::strings_column_view(input),
+                                                 *prog,
+                                                 "\\2/\\1",
+                                                 cudf::test::get_default_stream(),
+                                                 cudf::get_current_device_resource_ref());
+  EXPECT_THROW(
+    cudf::strings::execute_replace_with_backrefs(cudf::strings_column_view(other),
+                                                 prepared,
+                                                 cudf::test::get_default_stream(),
+                                                 cudf::get_current_device_resource_ref()),
+    cudf::logic_error);
+}
+
+TEST_F(StringsReplaceRegexTest, PreparedBackrefsRejectsDifferentStream)
+{
+  cudf::test::strings_column_wrapper input({"abc-123", "def-456"});
+  auto prog           = cudf::strings::regex_program::create("([a-z]+)-(\\d+)");
+  auto prepare_stream = cudf::test::get_default_stream();
+  auto* prepared =
+    cudf::strings::prepare_replace_with_backrefs(cudf::strings_column_view(input),
+                                                 *prog,
+                                                 "\\2/\\1",
+                                                 prepare_stream,
+                                                 cudf::get_current_device_resource_ref());
+  rmm::cuda_stream other_stream{};
+
+  EXPECT_THROW(
+    cudf::strings::execute_replace_with_backrefs(cudf::strings_column_view(input),
+                                                 prepared,
+                                                 other_stream.view(),
+                                                 cudf::get_current_device_resource_ref()),
+    cudf::logic_error);
+}
+
+TEST_F(StringsReplaceRegexTest, PreparedBackrefsEmptyInputHasNoRetainedState)
+{
+  cudf::test::strings_column_wrapper input;
+  auto prog   = cudf::strings::regex_program::create("(a)");
+  auto stream = cudf::test::get_default_stream();
+  auto* prepared =
+    cudf::strings::prepare_replace_with_backrefs(cudf::strings_column_view(input),
+                                                 *prog,
+                                                 "x\\1",
+                                                 stream,
+                                                 cudf::get_current_device_resource_ref());
+  auto const facts = cudf::strings::get_replace_with_backrefs_prepared_output_size_facts(*prepared);
+
+  EXPECT_EQ(facts.retained_output_bytes, 0);
+  EXPECT_EQ(facts.retained_state_bytes, 0);
+  EXPECT_EQ(facts.peak_execute_workspace_bytes, 0);
+  EXPECT_EQ(facts.execute_reservation_required_bytes, 0);
+
+  auto result = cudf::strings::execute_replace_with_backrefs(
+    cudf::strings_column_view(input), prepared, stream, cudf::get_current_device_resource_ref());
+  EXPECT_EQ(result->size(), 0);
+}
+
+TEST_F(StringsReplaceRegexTest, PreparedBackrefsUsesExplicitMemoryResourceAndReleasesState)
+{
+  cudf::test::strings_column_wrapper input({"abc-123", "def-456"}, {true, true});
+  auto view       = cudf::strings_column_view(input);
+  auto prog       = cudf::strings::regex_program::create("([a-z]+)-(\\d+)");
+  auto stream     = cudf::test::get_default_stream();
+  auto ambient_mr = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  auto target_mr  = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  auto target_ref = rmm::device_async_resource_ref{target_mr};
+
+  {
+    scoped_current_device_resource current_scope{
+      cuda::mr::any_resource<cuda::mr::device_accessible>{ambient_mr}};
+    auto* prepared =
+      cudf::strings::prepare_replace_with_backrefs(view, *prog, "\\2/\\1", stream, target_ref);
+    auto const facts =
+      cudf::strings::get_replace_with_backrefs_prepared_output_size_facts(*prepared);
+
+    EXPECT_EQ(ambient_mr.get_allocations_counter().total, 0);
+    EXPECT_EQ(static_cast<std::size_t>(target_mr.get_bytes_counter().value),
+              facts.retained_state_bytes);
+    EXPECT_GT(facts.execute_reservation_required_bytes, 0);
+
+    target_mr.push_counters();
+    auto result = cudf::strings::execute_replace_with_backrefs(view, prepared, stream, target_ref);
+    auto const execute_counters = target_mr.pop_counters();
+    EXPECT_LE(static_cast<std::size_t>(execute_counters.first.peak),
+              facts.execute_reservation_required_bytes);
+    EXPECT_EQ(facts.retained_output_bytes, result->alloc_size());
+    EXPECT_EQ(ambient_mr.get_allocations_counter().total, 0);
+  }
+  stream.synchronize();
+  EXPECT_EQ(target_mr.get_bytes_counter().value, 0);
+}
+
+TEST_F(StringsReplaceRegexTest, BackrefsPreflightReportsObservedWorkspaceBound)
+{
+  cudf::test::strings_column_wrapper input({"abc-123", "def-456"});
+  auto prog      = cudf::strings::regex_program::create("([a-z]+)-(\\d+)");
+  auto stream    = cudf::test::get_default_stream();
+  auto target_mr = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+
+  std::size_t retained_output_bytes{};
+  std::size_t temporary_workspace_bytes{};
+  cudf::strings::replace_with_backrefs_output_size(cudf::strings_column_view(input),
+                                                   *prog,
+                                                   "\\2/\\1",
+                                                   retained_output_bytes,
+                                                   temporary_workspace_bytes,
+                                                   stream,
+                                                   rmm::device_async_resource_ref{target_mr});
+  stream.synchronize();
+
+  EXPECT_EQ(retained_output_bytes, 26);
+  EXPECT_GE(temporary_workspace_bytes,
+            static_cast<std::size_t>(target_mr.get_bytes_counter().peak));
+  EXPECT_EQ(target_mr.get_bytes_counter().value, 0);
 }
 
 TEST_F(StringsReplaceRegexTest, MediumReplaceRegex)

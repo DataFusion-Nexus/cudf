@@ -12,6 +12,7 @@
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
 
@@ -61,6 +62,11 @@ class alignas(16) reprog_device {
    */
   static std::unique_ptr<reprog_device, std::function<void(reprog_device*)>> create(
     reprog const& prog, rmm::cuda_stream_view stream);
+
+  static std::unique_ptr<reprog_device, std::function<void(reprog_device*)>> create(
+    reprog const& prog, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr);
+
+  [[nodiscard]] std::size_t allocation_size() const { return _prog_size - sizeof(reprog_device); }
 
   /**
    * @brief Called automatically by the unique_ptr returned from create().

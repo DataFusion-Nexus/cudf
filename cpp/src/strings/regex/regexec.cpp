@@ -11,6 +11,7 @@
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/strings/detail/char_tables.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -36,6 +37,12 @@ reprog_device::reprog_device(reprog const& prog)
 std::unique_ptr<reprog_device, std::function<void(reprog_device*)>> reprog_device::create(
   reprog const& h_prog, rmm::cuda_stream_view stream)
 {
+  return create(h_prog, stream, cudf::get_current_device_resource_ref());
+}
+
+std::unique_ptr<reprog_device, std::function<void(reprog_device*)>> reprog_device::create(
+  reprog const& h_prog, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+{
   // compute size to hold all the member data
   auto const insts_count   = h_prog.insts_count();
   auto const classes_count = h_prog.classes_count();
@@ -59,8 +66,8 @@ std::unique_ptr<reprog_device, std::function<void(reprog_device*)>> reprog_devic
   auto h_buffer =
     cudf::detail::make_host_vector<u_char>(memsize, stream);  // copy everything into here;
   auto h_ptr    = h_buffer.data();                            // this is our running host ptr;
-  auto d_buffer = new rmm::device_uvector<u_char>(memsize, stream);  // output device memory;
-  auto d_ptr    = d_buffer->data();                                  // running device pointer
+  auto d_buffer = new rmm::device_uvector<u_char>(memsize, stream, mr);  // output device memory;
+  auto d_ptr    = d_buffer->data();                                      // running device pointer
 
   // create our device object; this is managed separately and returned to the caller
   auto* d_prog = new reprog_device(h_prog);

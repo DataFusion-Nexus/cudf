@@ -13,6 +13,7 @@
 #include <cudf/utilities/error.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <memory>
 
@@ -44,6 +45,13 @@ struct regex_device_builder {
   static auto create_prog_device(regex_program const& p, rmm::cuda_stream_view stream)
   {
     return detail::reprog_device::create(p._impl->prog, stream);
+  }
+
+  static auto create_prog_device(regex_program const& p,
+                                 rmm::cuda_stream_view stream,
+                                 rmm::device_async_resource_ref mr)
+  {
+    return detail::reprog_device::create(p._impl->prog, stream, mr);
   }
 
   static auto create_gkprog_device(regex_program const& p, rmm::cuda_stream_view stream)
