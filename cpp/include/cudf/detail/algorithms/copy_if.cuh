@@ -99,6 +99,7 @@ OutputIterator copy_if(InputIterator begin,
  * @param output Device-accessible iterator to start of output values
  * @param predicate Unary predicate that returns true for elements to copy
  * @param stream CUDA stream to use
+ * @param mr Device memory resource used to allocate temporary storage
  * @return Iterator pointing to the end of the output range
  */
 template <typename Predicate, typename InputIterator, typename OutputIterator>
@@ -106,13 +107,13 @@ OutputIterator copy_if(InputIterator begin,
                        InputIterator end,
                        OutputIterator output,
                        Predicate predicate,
-                       rmm::cuda_stream_view stream)
+                       rmm::cuda_stream_view stream,
+                       rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
 {
   auto const num_items = cuda::std::distance(begin, end);
 
   // Device scalar to store the number of selected elements
-  auto num_selected =
-    cudf::detail::device_scalar<cuda::std::size_t>(stream, cudf::get_current_device_resource_ref());
+  auto num_selected = cudf::detail::device_scalar<cuda::std::size_t>(stream, mr);
 
   // First call to get temporary storage size
   size_t temp_storage_bytes = 0;
@@ -126,8 +127,7 @@ OutputIterator copy_if(InputIterator begin,
                                       stream.value()));
 
   // Allocate temporary storage
-  rmm::device_buffer d_temp_storage(
-    temp_storage_bytes, stream, cudf::get_current_device_resource_ref());
+  rmm::device_buffer d_temp_storage(temp_storage_bytes, stream, mr);
 
   // Run copy_if
   CUDF_CUDA_TRY(cub::DeviceSelect::If(d_temp_storage.data(),

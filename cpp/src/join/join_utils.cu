@@ -119,8 +119,8 @@ VectorPair finalize_full_join(VectorPair&& indices,
   // of the same value are idempotent, so no atomics are needed. Word-sized stores coalesce into
   // full 128-byte transactions per warp; byte-sized flags cost ~2–3× here because partial-word
   // stores from dense scatters serialize within each 32-bit sector.
-  auto flags = cudf::detail::make_zeroed_device_uvector_async<size_type>(
-    right_table_num_rows, stream, cudf::get_current_device_resource_ref());
+  auto flags =
+    cudf::detail::make_zeroed_device_uvector_async<size_type>(right_table_num_rows, stream, mr);
 
   thrust::scatter_if(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
                      cuda::make_constant_iterator(size_type{1}),
@@ -141,7 +141,8 @@ VectorPair finalize_full_join(VectorPair&& indices,
                           cuda::counting_iterator<size_type>{right_table_num_rows},
                           out_iter,
                           unmatched_flag{flags.data()},
-                          stream);
+                          stream,
+                          mr);
 
   auto const comp_size = cuda::std::distance(out_iter, new_end);
   left_out->resize(match_total + comp_size, stream);

@@ -32,6 +32,7 @@ namespace CUDF_EXPORT cudf {
  */
 
 namespace detail {
+class mixed_full_join_size_data;
 class mixed_left_semi_anti_join_size_data;
 }  // namespace detail
 
@@ -91,6 +92,69 @@ class mixed_left_semi_anti_join_size_data {
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
   friend std::unique_ptr<mixed_left_semi_anti_join_size_data> mixed_left_anti_join_size(
+    table_view const& left_equality,
+    table_view const& right_equality,
+    table_view const& left_conditional,
+    table_view const& right_conditional,
+    ast::expression const& binary_predicate,
+    null_equality compare_nulls,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+};
+
+/**
+ * @brief Retained exact output-size data for a mixed full join.
+ *
+ * This object owns the finalized left/right gather maps computed by
+ * `mixed_full_join_size` from the left-outer hash/filter pipeline and full-join
+ * finalization, exposing the exact output row count and later materializing
+ * exact-sized gather maps without probing the mixed join or re-evaluating the
+ * predicate again. For non-empty inputs, materialization copies only retained
+ * state and does not access the input tables; for an empty input side the state
+ * retains the conditional input views and materializes trivial indices from
+ * their row counts.
+ *
+ * The original input tables used to create this object must remain alive until
+ * the retained state is destroyed.
+ *
+ * The retained device allocations are stream-ordered on the stream passed to
+ * the size function, so `materialize_indices` must be called on that same
+ * stream.
+ */
+class mixed_full_join_size_data {
+ public:
+  mixed_full_join_size_data() = delete;
+  ~mixed_full_join_size_data();
+  mixed_full_join_size_data(mixed_full_join_size_data const&)            = delete;
+  mixed_full_join_size_data(mixed_full_join_size_data&&)                 = delete;
+  mixed_full_join_size_data& operator=(mixed_full_join_size_data const&) = delete;
+  mixed_full_join_size_data& operator=(mixed_full_join_size_data&&)      = delete;
+
+  /**
+   * @brief Returns the exact number of rows produced by the mixed full join.
+   */
+  [[nodiscard]] std::size_t output_size() const;
+
+  /**
+   * @brief Materializes exact-sized left and right gather maps from retained state.
+   *
+   * @param stream CUDA stream used for device memory operations and kernel launches;
+   * must equal the stream passed to the size function that created this state
+   * @param mr Device memory resource used to allocate the returned indices
+   *
+   * @return A pair of vectors [`left_indices`, `right_indices`] with exactly
+   * `output_size()` rows each.
+   */
+  [[nodiscard]] std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
+                          std::unique_ptr<rmm::device_uvector<size_type>>>
+  materialize_indices(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const;
+
+ private:
+  explicit mixed_full_join_size_data(std::unique_ptr<cudf::detail::mixed_full_join_size_data> impl);
+
+  std::unique_ptr<cudf::detail::mixed_full_join_size_data> _impl;
+
+  friend std::unique_ptr<mixed_full_join_size_data> mixed_full_join_size(
     table_view const& left_equality,
     table_view const& right_equality,
     table_view const& left_conditional,
@@ -290,6 +354,42 @@ mixed_full_join(table_view const& left_equality,
                 output_size_data_type output_size_data = {},
                 rmm::cuda_stream_view stream           = cudf::get_default_stream(),
                 rmm::device_async_resource_ref mr      = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief Computes and retains exact output-size data for a mixed full join.
+ *
+ * The returned state owns the finalized left/right gather maps, reports the
+ * exact full-join output row count, and materializes exact-sized gather maps
+ * from retained state without probing the mixed join or re-evaluating the
+ * predicate again. The retained state must be materialized on the same stream
+ * passed to this function.
+ *
+ * @throw cudf::data_type_error If the binary predicate outputs a non-boolean result.
+ * @throw cudf::logic_error If the number of rows in left_equality and left_conditional do not
+ * match.
+ * @throw cudf::logic_error If the number of rows in right_equality and right_conditional do not
+ * match.
+ *
+ * @param left_equality The left table used for the equality join
+ * @param right_equality The right table used for the equality join
+ * @param left_conditional The left table used for the conditional join
+ * @param right_conditional The right table used for the conditional join
+ * @param binary_predicate The condition on which to join
+ * @param compare_nulls Whether or not null values join to each other or not
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate the retained state
+ *
+ * @return Retained mixed full join size data.
+ */
+std::unique_ptr<mixed_full_join_size_data> mixed_full_join_size(
+  table_view const& left_equality,
+  table_view const& right_equality,
+  table_view const& left_conditional,
+  table_view const& right_conditional,
+  ast::expression const& binary_predicate,
+  null_equality compare_nulls,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
 /**
  * @brief Returns an index vector corresponding to all rows in the left tables
