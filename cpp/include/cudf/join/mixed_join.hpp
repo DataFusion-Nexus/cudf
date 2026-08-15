@@ -31,6 +31,76 @@ namespace CUDF_EXPORT cudf {
  * @{
  */
 
+namespace detail {
+class mixed_left_semi_anti_join_size_data;
+}  // namespace detail
+
+/**
+ * @brief Retained exact output-size data for a mixed left semi or left anti join.
+ *
+ * This object owns the device-side left-row selection mask computed by
+ * `mixed_left_semi_join_size` or `mixed_left_anti_join_size`, exposing the exact
+ * output row count and later materializing an exact-sized left gather map
+ * without probing the mixed join again. Materialization reads only the retained
+ * mask; it does not access the input tables or re-evaluate the predicate.
+ *
+ * The retained device allocations are stream-ordered on the stream passed to
+ * the size function, so `materialize_indices` must be called on that same
+ * stream.
+ */
+class mixed_left_semi_anti_join_size_data {
+ public:
+  mixed_left_semi_anti_join_size_data() = delete;
+  ~mixed_left_semi_anti_join_size_data();
+  mixed_left_semi_anti_join_size_data(mixed_left_semi_anti_join_size_data const&) = delete;
+  mixed_left_semi_anti_join_size_data(mixed_left_semi_anti_join_size_data&&)      = delete;
+  mixed_left_semi_anti_join_size_data& operator=(mixed_left_semi_anti_join_size_data const&) =
+    delete;
+  mixed_left_semi_anti_join_size_data& operator=(mixed_left_semi_anti_join_size_data&&) = delete;
+
+  /**
+   * @brief Returns the exact number of selected left rows.
+   */
+  [[nodiscard]] std::size_t output_size() const;
+
+  /**
+   * @brief Materializes an exact-sized left gather map from retained state.
+   *
+   * @param stream CUDA stream used for device memory operations and kernel launches;
+   * must equal the stream passed to the size function that created this state
+   * @param mr Device memory resource used to allocate the returned indices
+   *
+   * @return A vector of selected left-row indices with exactly `output_size()` rows.
+   */
+  [[nodiscard]] std::unique_ptr<rmm::device_uvector<size_type>> materialize_indices(
+    rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const;
+
+ private:
+  explicit mixed_left_semi_anti_join_size_data(
+    std::unique_ptr<cudf::detail::mixed_left_semi_anti_join_size_data> impl);
+
+  std::unique_ptr<cudf::detail::mixed_left_semi_anti_join_size_data> _impl;
+
+  friend std::unique_ptr<mixed_left_semi_anti_join_size_data> mixed_left_semi_join_size(
+    table_view const& left_equality,
+    table_view const& right_equality,
+    table_view const& left_conditional,
+    table_view const& right_conditional,
+    ast::expression const& binary_predicate,
+    null_equality compare_nulls,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+  friend std::unique_ptr<mixed_left_semi_anti_join_size_data> mixed_left_anti_join_size(
+    table_view const& left_equality,
+    table_view const& right_equality,
+    table_view const& left_conditional,
+    table_view const& right_conditional,
+    ast::expression const& binary_predicate,
+    null_equality compare_nulls,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+};
+
 /**
  * @brief Type alias for output size data used in mixed joins.
  *
@@ -269,6 +339,37 @@ std::unique_ptr<rmm::device_uvector<size_type>> mixed_left_semi_join(
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
+ * @brief Computes and retains exact output-size data for a mixed left semi join.
+ *
+ * The returned state owns the left-row selection mask; it reports the exact
+ * number of selected rows and materializes the gather map without probing the
+ * mixed join again.
+ *
+ * @throw cudf::logic_error If the binary predicate outputs a non-boolean result.
+ * @throw cudf::logic_error If the paired equality/conditional row counts do not match.
+ *
+ * @param left_equality The left table used for the equality join
+ * @param right_equality The right table used for the equality join
+ * @param left_conditional The left table used for the conditional join
+ * @param right_conditional The right table used for the conditional join
+ * @param binary_predicate The condition on which to join
+ * @param compare_nulls Whether or not null values join to each other or not
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used for the retained state allocations
+ *
+ * @return Retained mixed left semi join size data.
+ */
+std::unique_ptr<mixed_left_semi_anti_join_size_data> mixed_left_semi_join_size(
+  table_view const& left_equality,
+  table_view const& right_equality,
+  table_view const& left_conditional,
+  table_view const& right_conditional,
+  ast::expression const& binary_predicate,
+  null_equality compare_nulls,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+/**
  * @brief Returns an index vector corresponding to all rows in the left tables
  * for which there is no row in the right tables where the columns of the
  * equality table are equal and the predicate evaluates to true on the
@@ -315,6 +416,37 @@ std::unique_ptr<rmm::device_uvector<size_type>> mixed_left_anti_join(
   null_equality compare_nulls       = null_equality::EQUAL,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief Computes and retains exact output-size data for a mixed left anti join.
+ *
+ * The returned state owns the left-row selection mask; it reports the exact
+ * number of selected rows and materializes the gather map without probing the
+ * mixed join again.
+ *
+ * @throw cudf::logic_error If the binary predicate outputs a non-boolean result.
+ * @throw cudf::logic_error If the paired equality/conditional row counts do not match.
+ *
+ * @param left_equality The left table used for the equality join
+ * @param right_equality The right table used for the equality join
+ * @param left_conditional The left table used for the conditional join
+ * @param right_conditional The right table used for the conditional join
+ * @param binary_predicate The condition on which to join
+ * @param compare_nulls Whether or not null values join to each other or not
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used for the retained state allocations
+ *
+ * @return Retained mixed left anti join size data.
+ */
+std::unique_ptr<mixed_left_semi_anti_join_size_data> mixed_left_anti_join_size(
+  table_view const& left_equality,
+  table_view const& right_equality,
+  table_view const& left_conditional,
+  table_view const& right_conditional,
+  ast::expression const& binary_predicate,
+  null_equality compare_nulls,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
 /**
  * @brief Returns the exact number of matches (rows) when performing a

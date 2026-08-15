@@ -17,6 +17,7 @@
 #include <cudf/join/mixed_join.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/exec_policy.hpp>
@@ -809,6 +810,117 @@ TEST_F(MixedInnerJoinTest2, ExplicitMemoryResourceProvenance)
   EXPECT_EQ(supplied_mr.get_bytes_counter().value, 0);
 }
 
+TEST_F(MixedInnerJoinTest2, RetainedContributionStateMaterializesExactOutput)
+{
+  auto const col_ref_left_1  = cudf::ast::column_reference(1, cudf::ast::table_reference::LEFT);
+  auto const col_ref_right_1 = cudf::ast::column_reference(1, cudf::ast::table_reference::RIGHT);
+  auto condition =
+    cudf::ast::operation(cudf::ast::ast_operator::GREATER, col_ref_left_1, col_ref_right_1);
+
+  cudf::test::fixed_width_column_wrapper<int32_t> left_key{{0, 1, 1}, {true, false, true}};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_key{{0, 1}, {true, false}};
+  cudf::test::fixed_width_column_wrapper<int32_t> left_filter{5, 6, 7};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_filter{1, 2};
+
+  cudf::table_view left_equality{{left_key}};
+  cudf::table_view right_equality{{right_key}};
+  cudf::table_view left_conditional{{left_key, left_filter}};
+  cudf::table_view right_conditional{{right_key, right_filter}};
+
+  auto const stream = cudf::get_default_stream();
+
+  auto const immediate_equal   = cudf::mixed_inner_join(left_equality,
+                                                      right_equality,
+                                                      left_conditional,
+                                                      right_conditional,
+                                                      condition,
+                                                      cudf::null_equality::EQUAL);
+  auto const immediate_unequal = cudf::mixed_inner_join(left_equality,
+                                                        right_equality,
+                                                        left_conditional,
+                                                        right_conditional,
+                                                        condition,
+                                                        cudf::null_equality::UNEQUAL);
+
+  auto ambient_mr  = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  auto supplied_mr = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  {
+    cudf::test::scoped_current_device_resource current_scope{ambient_mr};
+    auto const mr = rmm::device_async_resource_ref{supplied_mr};
+
+    auto run_retained =
+      [&](cudf::null_equality null_eq, PairJoinReturn const& immediate, std::size_t expected_size) {
+        auto [output_size, matches_per_row] = cudf::mixed_inner_join_size(left_equality,
+                                                                          right_equality,
+                                                                          left_conditional,
+                                                                          right_conditional,
+                                                                          condition,
+                                                                          null_eq,
+                                                                          stream,
+                                                                          mr);
+        stream.synchronize();
+        EXPECT_EQ(ambient_mr.get_bytes_counter().total, 0);
+        EXPECT_GT(supplied_mr.get_bytes_counter().total, 0);
+        EXPECT_EQ(output_size, expected_size);
+        EXPECT_EQ(output_size, immediate.first->size());
+
+        cudf::device_span<cudf::size_type const> counts_span{matches_per_row->data(),
+                                                             matches_per_row->size()};
+        auto retained = cudf::mixed_inner_join(left_equality,
+                                               right_equality,
+                                               left_conditional,
+                                               right_conditional,
+                                               condition,
+                                               null_eq,
+                                               std::make_pair(output_size, counts_span),
+                                               stream,
+                                               mr);
+        stream.synchronize();
+        EXPECT_EQ(retained.first->size(), output_size);
+        EXPECT_EQ(retained.second->size(), output_size);
+        this->compare_join_results(immediate, retained);
+        EXPECT_EQ(ambient_mr.get_bytes_counter().total, 0);
+      };
+
+    // The null left key matches the null right key only under null equality.
+    run_retained(cudf::null_equality::EQUAL, immediate_equal, 2);
+    run_retained(cudf::null_equality::UNEQUAL, immediate_unequal, 1);
+
+    // Empty probe side yields zero exact output without touching the ambient resource.
+    cudf::test::fixed_width_column_wrapper<int32_t> empty_key{};
+    cudf::test::fixed_width_column_wrapper<int32_t> empty_filter{};
+    cudf::table_view empty_left_equality{{empty_key}};
+    cudf::table_view empty_left_conditional{{empty_key, empty_filter}};
+    auto [empty_size, empty_counts] = cudf::mixed_inner_join_size(empty_left_equality,
+                                                                  right_equality,
+                                                                  empty_left_conditional,
+                                                                  right_conditional,
+                                                                  condition,
+                                                                  cudf::null_equality::EQUAL,
+                                                                  stream,
+                                                                  mr);
+    cudf::device_span<cudf::size_type const> empty_counts_span{empty_counts->data(),
+                                                               empty_counts->size()};
+    auto empty_retained = cudf::mixed_inner_join(empty_left_equality,
+                                                 right_equality,
+                                                 empty_left_conditional,
+                                                 right_conditional,
+                                                 condition,
+                                                 cudf::null_equality::EQUAL,
+                                                 std::make_pair(empty_size, empty_counts_span),
+                                                 stream,
+                                                 mr);
+    stream.synchronize();
+    EXPECT_EQ(empty_size, 0);
+    EXPECT_EQ(empty_retained.first->size(), 0);
+    EXPECT_EQ(empty_retained.second->size(), 0);
+    EXPECT_EQ(ambient_mr.get_bytes_counter().total, 0);
+  }
+  stream.synchronize();
+  EXPECT_EQ(ambient_mr.get_bytes_counter().value, 0);
+  EXPECT_EQ(supplied_mr.get_bytes_counter().value, 0);
+}
+
 TEST_F(MixedInnerJoinTest2, UnaryRightTableColumnReference)
 {
   using TypeParam            = int32_t;
@@ -1414,6 +1526,122 @@ TEST_F(MixedLeftJoinTest_int32, NullableColumnsWithArithmeticFilter)
     cudf::null_equality::EQUAL);
 }
 
+TEST_F(MixedLeftJoinTest_int32, RetainedContributionStateMaterializesExactOutput)
+{
+  auto const col_ref_left_1  = cudf::ast::column_reference(1, cudf::ast::table_reference::LEFT);
+  auto const col_ref_right_1 = cudf::ast::column_reference(1, cudf::ast::table_reference::RIGHT);
+  auto condition =
+    cudf::ast::operation(cudf::ast::ast_operator::GREATER, col_ref_left_1, col_ref_right_1);
+
+  cudf::test::fixed_width_column_wrapper<int32_t> left_key{{0, 1, 1}, {true, false, true}};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_key{{0, 1}, {true, false}};
+  cudf::test::fixed_width_column_wrapper<int32_t> left_filter{5, 6, 7};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_filter{1, 2};
+
+  cudf::table_view left_equality{{left_key}};
+  cudf::table_view right_equality{{right_key}};
+  cudf::table_view left_conditional{{left_key, left_filter}};
+  cudf::table_view right_conditional{{right_key, right_filter}};
+
+  auto const stream = cudf::get_default_stream();
+
+  auto const immediate_equal   = cudf::mixed_left_join(left_equality,
+                                                     right_equality,
+                                                     left_conditional,
+                                                     right_conditional,
+                                                     condition,
+                                                     cudf::null_equality::EQUAL);
+  auto const immediate_unequal = cudf::mixed_left_join(left_equality,
+                                                       right_equality,
+                                                       left_conditional,
+                                                       right_conditional,
+                                                       condition,
+                                                       cudf::null_equality::UNEQUAL);
+
+  auto ambient_mr  = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  auto supplied_mr = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  {
+    cudf::test::scoped_current_device_resource current_scope{ambient_mr};
+    auto const mr = rmm::device_async_resource_ref{supplied_mr};
+
+    auto run_retained =
+      [&](cudf::null_equality null_eq, PairJoinReturn const& immediate, std::size_t expected_size) {
+        auto [output_size, matches_per_row] = cudf::mixed_left_join_size(left_equality,
+                                                                         right_equality,
+                                                                         left_conditional,
+                                                                         right_conditional,
+                                                                         condition,
+                                                                         null_eq,
+                                                                         stream,
+                                                                         mr);
+        stream.synchronize();
+        EXPECT_EQ(ambient_mr.get_bytes_counter().total, 0);
+        EXPECT_GT(supplied_mr.get_bytes_counter().total, 0);
+        EXPECT_EQ(output_size, expected_size);
+        EXPECT_EQ(output_size, immediate.first->size());
+
+        cudf::device_span<cudf::size_type const> counts_span{matches_per_row->data(),
+                                                             matches_per_row->size()};
+        auto retained = cudf::mixed_left_join(left_equality,
+                                              right_equality,
+                                              left_conditional,
+                                              right_conditional,
+                                              condition,
+                                              null_eq,
+                                              std::make_pair(output_size, counts_span),
+                                              stream,
+                                              mr);
+        stream.synchronize();
+        EXPECT_EQ(retained.first->size(), output_size);
+        EXPECT_EQ(retained.second->size(), output_size);
+        this->compare_join_results(immediate, retained);
+        EXPECT_EQ(ambient_mr.get_bytes_counter().total, 0);
+      };
+
+    // Every left row is preserved; the null left key finds a real right match only under
+    // null equality.
+    run_retained(cudf::null_equality::EQUAL, immediate_equal, 3);
+    run_retained(cudf::null_equality::UNEQUAL, immediate_unequal, 3);
+
+    // Empty build side yields one trivial unmatched pair per left row.
+    cudf::test::fixed_width_column_wrapper<int32_t> empty_key{};
+    cudf::test::fixed_width_column_wrapper<int32_t> empty_filter{};
+    cudf::table_view empty_right_equality{{empty_key}};
+    cudf::table_view empty_right_conditional{{empty_key, empty_filter}};
+    auto [empty_size, empty_counts] = cudf::mixed_left_join_size(left_equality,
+                                                                 empty_right_equality,
+                                                                 left_conditional,
+                                                                 empty_right_conditional,
+                                                                 condition,
+                                                                 cudf::null_equality::EQUAL,
+                                                                 stream,
+                                                                 mr);
+    cudf::device_span<cudf::size_type const> empty_counts_span{empty_counts->data(),
+                                                               empty_counts->size()};
+    auto empty_retained = cudf::mixed_left_join(left_equality,
+                                                empty_right_equality,
+                                                left_conditional,
+                                                empty_right_conditional,
+                                                condition,
+                                                cudf::null_equality::EQUAL,
+                                                std::make_pair(empty_size, empty_counts_span),
+                                                stream,
+                                                mr);
+    stream.synchronize();
+    EXPECT_EQ(empty_size, 3);
+    ASSERT_EQ(empty_retained.first->size(), 3);
+    ASSERT_EQ(empty_retained.second->size(), 3);
+    for (std::size_t i = 0; i < 3; ++i) {
+      EXPECT_EQ(empty_retained.first->element(i, stream), static_cast<cudf::size_type>(i));
+      EXPECT_EQ(empty_retained.second->element(i, stream), cudf::JoinNoMatch);
+    }
+    EXPECT_EQ(ambient_mr.get_bytes_counter().total, 0);
+  }
+  stream.synchronize();
+  EXPECT_EQ(ambient_mr.get_bytes_counter().value, 0);
+  EXPECT_EQ(supplied_mr.get_bytes_counter().value, 0);
+}
+
 /**
  * Tests of mixed full joins.
  */
@@ -1721,6 +1949,63 @@ struct MixedLeftSemiJoinTest : public MixedJoinSingleReturnTest<T> {
 
 TYPED_TEST_SUITE(MixedLeftSemiJoinTest, cudf::test::IntegralTypesNotBool);
 
+using MixedLeftSemiJoinTest_int32 = MixedLeftSemiJoinTest<int32_t>;
+
+TEST_F(MixedLeftSemiJoinTest_int32, RetainedSizeDataMaterializesSemiJoin)
+{
+  auto const col_ref_left  = cudf::ast::column_reference(0, cudf::ast::table_reference::LEFT);
+  auto const col_ref_right = cudf::ast::column_reference(0, cudf::ast::table_reference::RIGHT);
+  auto predicate = cudf::ast::operation(cudf::ast::ast_operator::LESS, col_ref_left, col_ref_right);
+
+  cudf::test::fixed_width_column_wrapper<int32_t> left_key{{1, 2, 3}, {true, false, true}};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_key{{1, 2}, {true, false}};
+  cudf::test::fixed_width_column_wrapper<int32_t> left_filter{1, 5, 9};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_filter{2, 7};
+
+  cudf::table_view left_equality{{left_key}};
+  cudf::table_view right_equality{{right_key}};
+  cudf::table_view left_conditional{{left_filter}};
+  cudf::table_view right_conditional{{right_filter}};
+
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  auto expect_retained_matches_immediate = [&](cudf::null_equality null_eq,
+                                               std::vector<cudf::size_type> expected) {
+    auto retained         = cudf::mixed_left_semi_join_size(left_equality,
+                                                    right_equality,
+                                                    left_conditional,
+                                                    right_conditional,
+                                                    predicate,
+                                                    null_eq,
+                                                    stream,
+                                                    mr);
+    auto const immediate  = cudf::mixed_left_semi_join(left_equality,
+                                                      right_equality,
+                                                      left_conditional,
+                                                      right_conditional,
+                                                      predicate,
+                                                      null_eq,
+                                                      stream,
+                                                      mr);
+    auto retained_indices = retained->materialize_indices(stream, mr);
+    EXPECT_EQ(retained->output_size(), immediate->size());
+    ASSERT_EQ(retained_indices->size(), retained->output_size());
+
+    std::vector<cudf::size_type> indices;
+    for (std::size_t i = 0; i < retained_indices->size(); ++i) {
+      indices.push_back(retained_indices->element(i, stream));
+    }
+    std::sort(indices.begin(), indices.end());
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(indices, expected);
+  };
+
+  // The null left key matches the null right key only under null equality.
+  expect_retained_matches_immediate(cudf::null_equality::EQUAL, {0, 1});
+  expect_retained_matches_immediate(cudf::null_equality::UNEQUAL, {0});
+}
+
 TYPED_TEST(MixedLeftSemiJoinTest, BasicEquality)
 {
   this->test({{0, 1, 2}, {3, 4, 5}, {10, 20, 30}},
@@ -1934,6 +2219,63 @@ struct MixedLeftAntiJoinTest : public MixedJoinSingleReturnTest<T> {
 
 TYPED_TEST_SUITE(MixedLeftAntiJoinTest, cudf::test::IntegralTypesNotBool);
 
+using MixedLeftAntiJoinTest_int32 = MixedLeftAntiJoinTest<int32_t>;
+
+TEST_F(MixedLeftAntiJoinTest_int32, RetainedSizeDataMaterializesAntiJoin)
+{
+  auto const col_ref_left  = cudf::ast::column_reference(0, cudf::ast::table_reference::LEFT);
+  auto const col_ref_right = cudf::ast::column_reference(0, cudf::ast::table_reference::RIGHT);
+  auto predicate = cudf::ast::operation(cudf::ast::ast_operator::LESS, col_ref_left, col_ref_right);
+
+  cudf::test::fixed_width_column_wrapper<int32_t> left_key{{1, 2, 3}, {true, false, true}};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_key{{1, 2}, {true, false}};
+  cudf::test::fixed_width_column_wrapper<int32_t> left_filter{1, 5, 9};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_filter{2, 7};
+
+  cudf::table_view left_equality{{left_key}};
+  cudf::table_view right_equality{{right_key}};
+  cudf::table_view left_conditional{{left_filter}};
+  cudf::table_view right_conditional{{right_filter}};
+
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  auto expect_retained_matches_immediate = [&](cudf::null_equality null_eq,
+                                               std::vector<cudf::size_type> expected) {
+    auto retained         = cudf::mixed_left_anti_join_size(left_equality,
+                                                    right_equality,
+                                                    left_conditional,
+                                                    right_conditional,
+                                                    predicate,
+                                                    null_eq,
+                                                    stream,
+                                                    mr);
+    auto const immediate  = cudf::mixed_left_anti_join(left_equality,
+                                                      right_equality,
+                                                      left_conditional,
+                                                      right_conditional,
+                                                      predicate,
+                                                      null_eq,
+                                                      stream,
+                                                      mr);
+    auto retained_indices = retained->materialize_indices(stream, mr);
+    EXPECT_EQ(retained->output_size(), immediate->size());
+    ASSERT_EQ(retained_indices->size(), retained->output_size());
+
+    std::vector<cudf::size_type> indices;
+    for (std::size_t i = 0; i < retained_indices->size(); ++i) {
+      indices.push_back(retained_indices->element(i, stream));
+    }
+    std::sort(indices.begin(), indices.end());
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(indices, expected);
+  };
+
+  // The null left key is rejected only when null equality lets it match.
+  expect_retained_matches_immediate(cudf::null_equality::EQUAL, {2});
+  expect_retained_matches_immediate(cudf::null_equality::UNEQUAL, {1, 2});
+}
+
 TYPED_TEST(MixedLeftAntiJoinTest, BasicEquality)
 {
   this->test({{0, 1, 2}, {3, 4, 5}, {10, 20, 30}},
@@ -1999,4 +2341,194 @@ TYPED_TEST(MixedLeftAntiJoinTest, MixedLeftAntiJoinGatherMap)
              {1},
              left_one_greater_right_one,
              {0, 1, 3, 4, 5, 6, 9});
+}
+
+TEST(MixedJoinSizeDataMemoryResourceTest, RetainedSemiAntiStateUsesExplicitMemoryResource)
+{
+  auto const col_ref_left  = cudf::ast::column_reference(0, cudf::ast::table_reference::LEFT);
+  auto const col_ref_right = cudf::ast::column_reference(0, cudf::ast::table_reference::RIGHT);
+  auto predicate = cudf::ast::operation(cudf::ast::ast_operator::LESS, col_ref_left, col_ref_right);
+
+  cudf::test::fixed_width_column_wrapper<int32_t> left_key{{1, 2, 3}, {true, false, true}};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_key{{1, 2}, {true, false}};
+  cudf::test::fixed_width_column_wrapper<int32_t> left_filter{1, 5, 9};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_filter{2, 7};
+
+  cudf::table_view left_equality{{left_key}};
+  cudf::table_view right_equality{{right_key}};
+  cudf::table_view left_conditional{{left_filter}};
+  cudf::table_view right_conditional{{right_filter}};
+
+  auto const stream = cudf::get_default_stream();
+
+  auto ambient_mr  = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  auto supplied_mr = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  {
+    cudf::test::scoped_current_device_resource current_scope{ambient_mr};
+    auto const mr = rmm::device_async_resource_ref{supplied_mr};
+
+    auto semi = cudf::mixed_left_semi_join_size(left_equality,
+                                                right_equality,
+                                                left_conditional,
+                                                right_conditional,
+                                                predicate,
+                                                cudf::null_equality::UNEQUAL,
+                                                stream,
+                                                mr);
+    auto anti = cudf::mixed_left_anti_join_size(left_equality,
+                                                right_equality,
+                                                left_conditional,
+                                                right_conditional,
+                                                predicate,
+                                                cudf::null_equality::UNEQUAL,
+                                                stream,
+                                                mr);
+    stream.synchronize();
+    EXPECT_EQ(ambient_mr.get_bytes_counter().total, 0);
+    EXPECT_GT(supplied_mr.get_bytes_counter().total, 0);
+    EXPECT_EQ(semi->output_size(), 1);
+    EXPECT_EQ(anti->output_size(), 2);
+
+    auto semi_indices = semi->materialize_indices(stream, mr);
+    auto anti_indices = anti->materialize_indices(stream, mr);
+    stream.synchronize();
+    EXPECT_EQ(semi_indices->size(), 1);
+    EXPECT_EQ(anti_indices->size(), 2);
+    EXPECT_EQ(ambient_mr.get_bytes_counter().total, 0);
+  }
+  stream.synchronize();
+  EXPECT_EQ(ambient_mr.get_bytes_counter().value, 0);
+  EXPECT_EQ(supplied_mr.get_bytes_counter().value, 0);
+}
+
+TEST(MixedLeftSemiAntiJoinSizeDataTest, EmptyInputsRetainNoDeviceState)
+{
+  auto const col_ref_left  = cudf::ast::column_reference(0, cudf::ast::table_reference::LEFT);
+  auto const col_ref_right = cudf::ast::column_reference(0, cudf::ast::table_reference::RIGHT);
+  auto predicate = cudf::ast::operation(cudf::ast::ast_operator::LESS, col_ref_left, col_ref_right);
+
+  cudf::test::fixed_width_column_wrapper<int32_t> left_key{1, 2, 3};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_key{1, 2};
+  cudf::test::fixed_width_column_wrapper<int32_t> left_filter{1, 5, 9};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_filter{2, 4};
+  cudf::test::fixed_width_column_wrapper<int32_t> empty_key{};
+  cudf::test::fixed_width_column_wrapper<int32_t> empty_filter{};
+
+  auto const stream = cudf::get_default_stream();
+
+  auto ambient_mr  = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  auto supplied_mr = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  {
+    cudf::test::scoped_current_device_resource current_scope{ambient_mr};
+    auto const mr = rmm::device_async_resource_ref{supplied_mr};
+
+    auto expect_empty_state = [&](cudf::table_view left_equality,
+                                  cudf::table_view right_equality,
+                                  cudf::table_view left_conditional,
+                                  cudf::table_view right_conditional,
+                                  std::vector<cudf::size_type> expected_semi,
+                                  std::vector<cudf::size_type> expected_anti) {
+      auto const before = supplied_mr.get_bytes_counter().total;
+      auto semi         = cudf::mixed_left_semi_join_size(left_equality,
+                                                  right_equality,
+                                                  left_conditional,
+                                                  right_conditional,
+                                                  predicate,
+                                                  cudf::null_equality::EQUAL,
+                                                  stream,
+                                                  mr);
+      auto anti         = cudf::mixed_left_anti_join_size(left_equality,
+                                                  right_equality,
+                                                  left_conditional,
+                                                  right_conditional,
+                                                  predicate,
+                                                  cudf::null_equality::EQUAL,
+                                                  stream,
+                                                  mr);
+      stream.synchronize();
+      EXPECT_EQ(semi->output_size(), expected_semi.size());
+      EXPECT_EQ(anti->output_size(), expected_anti.size());
+      EXPECT_EQ(ambient_mr.get_bytes_counter().total, 0);
+      EXPECT_EQ(supplied_mr.get_bytes_counter().total, before);
+
+      auto semi_indices = semi->materialize_indices(stream, mr);
+      auto anti_indices = anti->materialize_indices(stream, mr);
+      stream.synchronize();
+      ASSERT_EQ(semi_indices->size(), expected_semi.size());
+      ASSERT_EQ(anti_indices->size(), expected_anti.size());
+      for (std::size_t i = 0; i < expected_semi.size(); ++i) {
+        EXPECT_EQ(semi_indices->element(i, stream), expected_semi[i]);
+      }
+      for (std::size_t i = 0; i < expected_anti.size(); ++i) {
+        EXPECT_EQ(anti_indices->element(i, stream), expected_anti[i]);
+      }
+    };
+
+    // Empty build side: semi selects nothing, anti selects every left row.
+    expect_empty_state(cudf::table_view{{left_key}},
+                       cudf::table_view{{empty_key}},
+                       cudf::table_view{{left_filter}},
+                       cudf::table_view{{empty_filter}},
+                       {},
+                       {0, 1, 2});
+    // Empty probe side: both joins select nothing.
+    expect_empty_state(cudf::table_view{{empty_key}},
+                       cudf::table_view{{right_key}},
+                       cudf::table_view{{empty_filter}},
+                       cudf::table_view{{right_filter}},
+                       {},
+                       {});
+  }
+  stream.synchronize();
+  EXPECT_EQ(ambient_mr.get_bytes_counter().value, 0);
+  EXPECT_EQ(supplied_mr.get_bytes_counter().value, 0);
+}
+
+TEST(MixedLeftSemiAntiJoinSizeDataTest, FailedSizeComputationReleasesSuppliedMemory)
+{
+  auto const col_ref_left  = cudf::ast::column_reference(0, cudf::ast::table_reference::LEFT);
+  auto const col_ref_right = cudf::ast::column_reference(0, cudf::ast::table_reference::RIGHT);
+  auto non_boolean_predicate =
+    cudf::ast::operation(cudf::ast::ast_operator::ADD, col_ref_left, col_ref_right);
+
+  cudf::test::fixed_width_column_wrapper<int32_t> left_key{1, 2, 3};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_key{1, 2};
+  cudf::test::fixed_width_column_wrapper<int32_t> left_filter{1, 5, 9};
+  cudf::test::fixed_width_column_wrapper<int32_t> right_filter{2, 4};
+
+  cudf::table_view left_equality{{left_key}};
+  cudf::table_view right_equality{{right_key}};
+  cudf::table_view left_conditional{{left_filter}};
+  cudf::table_view right_conditional{{right_filter}};
+
+  auto const stream = cudf::get_default_stream();
+
+  auto ambient_mr  = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  auto supplied_mr = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+  {
+    cudf::test::scoped_current_device_resource current_scope{ambient_mr};
+    auto const mr = rmm::device_async_resource_ref{supplied_mr};
+
+    EXPECT_THROW((void)cudf::mixed_left_semi_join_size(left_equality,
+                                                       right_equality,
+                                                       left_conditional,
+                                                       right_conditional,
+                                                       non_boolean_predicate,
+                                                       cudf::null_equality::EQUAL,
+                                                       stream,
+                                                       mr),
+                 cudf::logic_error);
+    EXPECT_THROW((void)cudf::mixed_left_anti_join_size(left_equality,
+                                                       right_equality,
+                                                       left_conditional,
+                                                       right_conditional,
+                                                       non_boolean_predicate,
+                                                       cudf::null_equality::EQUAL,
+                                                       stream,
+                                                       mr),
+                 cudf::logic_error);
+    stream.synchronize();
+    EXPECT_EQ(ambient_mr.get_bytes_counter().total, 0);
+    EXPECT_EQ(supplied_mr.get_bytes_counter().value, 0);
+  }
 }
