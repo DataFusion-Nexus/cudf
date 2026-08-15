@@ -57,6 +57,22 @@ struct preprocessed_table {
     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /**
+   * @brief Returns the exact device bytes `create` would retain for `table`.
+   *
+   * Covers the preprocessed table-device-view storage and any null masks or sanitized
+   * columns retained by null push-down. The call only reads table metadata and allocates
+   * no device memory.
+   *
+   * @param table The table that would be preprocessed
+   * @param stream CUDA stream used to inspect null/offset metadata
+   * @return Exact retained device bytes
+   *
+   * @throw std::invalid_argument if `table` fails the same compatibility checks as `create`
+   */
+  [[nodiscard]] static std::size_t create_reservation_size(table_view const& table,
+                                                           rmm::cuda_stream_view stream);
+
+  /**
    * @brief Implicit conversion operator to a `table_device_view` of the preprocessed table.
    *
    * @return table_device_view

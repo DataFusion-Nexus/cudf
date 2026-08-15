@@ -31,6 +31,34 @@ using cudf::detail::row::lhs_index_type;
 using cudf::detail::row::rhs_index_type;
 
 /**
+ * @brief Retained filtered-join probe state.
+ *
+ * A probe state owns the device-side membership result of probing a reusable
+ * filtered join. Callers can inspect the exact selected row count before
+ * materializing the final gather map.
+ */
+class filtered_join_probe_state {
+ public:
+  virtual ~filtered_join_probe_state() = default;
+
+  /**
+   * @brief Returns the exact number of rows selected by this probe.
+   */
+  [[nodiscard]] virtual cudf::size_type output_size() const = 0;
+
+  /**
+   * @brief Returns retained device bytes owned by this probe state.
+   */
+  [[nodiscard]] virtual std::size_t device_allocated_size_bytes() const = 0;
+
+  /**
+   * @brief Materializes selected probe indices from the retained state.
+   */
+  [[nodiscard]] virtual std::unique_ptr<rmm::device_uvector<cudf::size_type>>
+  materialize_indices(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const = 0;
+};
+
+/**
  * @brief Base class providing common functionality for filtered join operations.
  *
  * This abstract class implements the core components needed for hash-based semi
@@ -130,11 +158,13 @@ class filtered_join {
    * @param compare_nulls How null values should be compared
    * @param load_factor Target load factor for the hash table
    * @param stream CUDA stream on which to perform operations
+   * @param mr Device memory resource used for the retained hash table and preprocessing state
    */
   filtered_join(cudf::table_view const& right,
                 cudf::null_equality compare_nulls,
                 double load_factor,
-                rmm::cuda_stream_view stream);
+                rmm::cuda_stream_view stream,
+                rmm::device_async_resource_ref mr);
 
   /**
    * Virtual semi join function overridden in derived classes
@@ -151,6 +181,37 @@ class filtered_join {
     cudf::table_view const& left,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) = 0;
+
+  /**
+   * Virtual semi probe-state function overridden in derived classes
+   */
+  virtual std::unique_ptr<filtered_join_probe_state> begin_left_semi_probe(
+    cudf::table_view const& left,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) = 0;
+
+  /**
+   * Virtual anti probe-state function overridden in derived classes
+   */
+  virtual std::unique_ptr<filtered_join_probe_state> begin_left_anti_probe(
+    cudf::table_view const& left,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) = 0;
+
+  /**
+   * @brief Returns the exact device bytes retained by constructing a filtered join.
+   *
+   * Covers the hash-table bucket storage and the preprocessed right-table state. The
+   * call only reads right-table metadata and allocates no device memory.
+   *
+   * @param right The right table that would be used to build the hash table
+   * @param load_factor Target load factor for the hash table
+   * @param stream CUDA stream used to inspect right-table metadata
+   * @return Exact retained device bytes
+   */
+  [[nodiscard]] static std::size_t retained_reservation_size(cudf::table_view const& right,
+                                                             double load_factor,
+                                                             rmm::cuda_stream_view stream);
 
   /**
    * Virtual abstract base class destructor
@@ -207,9 +268,12 @@ class filtered_join {
    * @tparam Ref Reference type for the hash table
    * @param insert_ref Reference to the hash table for insertion
    * @param stream CUDA stream on which to perform operations
+   * @param mr Device memory resource used for bitmask temporaries
    */
   template <int32_t CGSize, typename Ref>
-  void insert_right_table(Ref const& insert_ref, rmm::cuda_stream_view stream);
+  void insert_right_table(Ref const& insert_ref,
+                          rmm::cuda_stream_view stream,
+                          rmm::device_async_resource_ref mr);
 
  private:
   /**
@@ -222,7 +286,7 @@ class filtered_join {
    * @param load_factor Target load factor for the hash table
    * @return Calculated bucket storage size
    */
-  auto compute_bucket_storage_size(cudf::table_view tbl, double load_factor);
+  static auto compute_bucket_storage_size(cudf::table_view tbl, double load_factor);
 };
 
 }  // namespace detail

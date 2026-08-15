@@ -6,6 +6,7 @@
 #include "lists/utilities.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_device_view.cuh>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/concatenate.hpp>
 #include <cudf/detail/copy.hpp>
@@ -17,15 +18,28 @@
 #include <cudf/detail/utilities/linked_column.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/lists/lists_column_view.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/strings/strings_column_view.hpp>
+#include <cudf/strings/utilities.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/type_checks.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <thrust/iterator/transform_iterator.h>
 
+#include <cuda_runtime_api.h>
+
+#include <algorithm>
+#include <array>
+#include <climits>
+#include <cstdint>
 #include <functional>
+#include <limits>
+#include <numeric>
 #include <stdexcept>
+#include <vector>
 
 namespace cudf {
 namespace detail {
@@ -842,6 +856,427 @@ two_table_comparator::two_table_comparator(table_view const& left,
 
 namespace equality {
 
+namespace {
+
+constexpr std::size_t reservation_scan_chunk_rows = 4096;
+
+std::size_t reservation_checked_add(std::size_t lhs, std::size_t rhs)
+{
+  CUDF_EXPECTS(lhs <= std::numeric_limits<std::size_t>::max() - rhs,
+               "row operator preprocessing reservation size overflow",
+               std::overflow_error);
+  return lhs + rhs;
+}
+
+std::size_t reservation_checked_mul(std::size_t lhs, std::size_t rhs)
+{
+  CUDF_EXPECTS(rhs == 0 || lhs <= std::numeric_limits<std::size_t>::max() / rhs,
+               "row operator preprocessing reservation size overflow",
+               std::overflow_error);
+  return lhs * rhs;
+}
+
+// Whether the dirty-row gate reads the stored view metadata or the exact count produced by
+// null push-down. This mirrors `column_view::has_nulls()` on the view that
+// `has_nonempty_nulls` observes at each recursion level. FORCE_CLEAN mirrors the mask
+// adoption case, where the pushed child view reports zero nulls.
+enum class simulated_null_count { STORED, EXACT, FORCE_CLEAN };
+
+// A column as seen by null push-down: original storage plus the masks ANDed into its
+// validity. All masks use absolute bit addressing; row i is addressed at `offset + i`.
+struct simulated_column {
+  column_view storage;
+  std::vector<bitmask_type const*> validity_masks;
+  simulated_null_count null_count_rule;
+  size_type offset;
+  size_type size;
+  std::vector<simulated_column> children;  // STRUCT columns: null-pushed or raw children
+};
+
+bool simulated_dirty_gate(simulated_column const& node)
+{
+  if (node.validity_masks.empty() || node.null_count_rule == simulated_null_count::FORCE_CLEAN) {
+    return false;
+  }
+  return node.null_count_rule == simulated_null_count::EXACT || node.storage.null_count() > 0;
+}
+
+// Scans rows [row_begin, row_end) of a string/list node in bounded chunks, invoking
+// `fn(valid, offset_begin, offset_end)` per row. Reads device metadata only; allocates nothing.
+template <typename Offset, typename RowFn>
+void scan_variable_width_rows(column_view const& offsets_child,
+                              std::vector<bitmask_type const*> const& masks,
+                              std::size_t row_begin,
+                              std::size_t row_end,
+                              rmm::cuda_stream_view stream,
+                              RowFn&& fn)
+{
+  auto const* const offsets  = offsets_child.head<Offset>();
+  constexpr auto bits_per_word = sizeof(bitmask_type) * CHAR_BIT;
+  std::array<Offset, reservation_scan_chunk_rows + 1> host_offsets{};
+  std::array<bitmask_type, reservation_scan_chunk_rows / bits_per_word + 2> host_words{};
+  std::array<bitmask_type, reservation_scan_chunk_rows / bits_per_word + 2> mask_words{};
+
+  for (auto begin = row_begin; begin < row_end;) {
+    auto const rows       = std::min(reservation_scan_chunk_rows, row_end - begin);
+    auto const first_word = begin / bits_per_word;
+    auto const word_count = (begin + rows - 1) / bits_per_word - first_word + 1;
+    CUDF_CUDA_TRY(cudaMemcpyAsync(host_offsets.data(),
+                                  offsets + begin,
+                                  (rows + 1) * sizeof(Offset),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    bool first_mask = true;
+    for (auto const* mask : masks) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(mask_words.data(),
+                                    mask + first_word,
+                                    word_count * sizeof(bitmask_type),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.value()));
+      stream.synchronize();
+      for (std::size_t word = 0; word < word_count; ++word) {
+        host_words[word] = first_mask ? mask_words[word] : (host_words[word] & mask_words[word]);
+      }
+      first_mask = false;
+    }
+    stream.synchronize();
+    for (std::size_t row = 0; row < rows; ++row) {
+      auto const valid = masks.empty() ||
+                         cudf::bit_is_set(host_words.data(),
+                                          static_cast<size_type>(begin + row -
+                                                                 first_word * bits_per_word));
+      auto const offset_begin = static_cast<int64_t>(host_offsets[row]);
+      auto const offset_end   = static_cast<int64_t>(host_offsets[row + 1]);
+      CUDF_EXPECTS(offset_begin >= 0 && offset_end >= offset_begin,
+                   "invalid offsets while sizing row operator preprocessing",
+                   std::invalid_argument);
+      fn(valid, offset_begin, offset_end);
+    }
+    begin += rows;
+  }
+}
+
+template <typename RowFn>
+void scan_node_rows(simulated_column const& node,
+                    std::size_t local_begin,
+                    std::size_t local_end,
+                    rmm::cuda_stream_view stream,
+                    RowFn&& fn)
+{
+  auto const type = node.storage.type().id();
+  auto const offsets_child =
+    type == type_id::STRING
+      ? strings_column_view{node.storage}.offsets()
+      : lists_column_view{node.storage}.offsets();
+  auto const abs_begin = static_cast<std::size_t>(node.offset) + local_begin;
+  auto const abs_end   = static_cast<std::size_t>(node.offset) + local_end;
+  if (type == type_id::STRING && offsets_child.type().id() == type_id::INT64) {
+    scan_variable_width_rows<int64_t>(
+      offsets_child, node.validity_masks, abs_begin, abs_end, stream, fn);
+  } else {
+    CUDF_EXPECTS(offsets_child.type().id() == type_id::INT32,
+                 "string/list offsets must use INT32 or INT64",
+                 cudf::data_type_error);
+    scan_variable_width_rows<int32_t>(
+      offsets_child, node.validity_masks, abs_begin, abs_end, stream, fn);
+  }
+}
+
+// Returns true if `mask` has an unset bit in [bit_begin, bit_end), reading in bounded chunks.
+bool mask_has_unset_bits(bitmask_type const* mask,
+                         std::size_t bit_begin,
+                         std::size_t bit_end,
+                         rmm::cuda_stream_view stream)
+{
+  if (mask == nullptr || bit_begin >= bit_end) { return false; }
+  constexpr auto bits_per_word = sizeof(bitmask_type) * CHAR_BIT;
+  std::array<bitmask_type, reservation_scan_chunk_rows / bits_per_word + 2> host_words{};
+  for (auto begin = bit_begin; begin < bit_end;) {
+    auto const bits       = std::min(reservation_scan_chunk_rows, bit_end - begin);
+    auto const first_word = begin / bits_per_word;
+    auto const word_count = (begin + bits - 1) / bits_per_word - first_word + 1;
+    CUDF_CUDA_TRY(cudaMemcpyAsync(host_words.data(),
+                                  mask + first_word,
+                                  word_count * sizeof(bitmask_type),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    stream.synchronize();
+    for (std::size_t bit = 0; bit < bits; ++bit) {
+      if (!cudf::bit_is_set(host_words.data(),
+                            static_cast<size_type>(begin + bit - first_word * bits_per_word))) {
+        return true;
+      }
+    }
+    begin += bits;
+  }
+  return false;
+}
+
+template <typename Offset>
+Offset read_offset_value(column_view const& offsets_child,
+                         std::size_t position,
+                         rmm::cuda_stream_view stream)
+{
+  Offset value{};
+  CUDF_CUDA_TRY(cudaMemcpyAsync(&value,
+                                offsets_child.head<Offset>() + position,
+                                sizeof(Offset),
+                                cudaMemcpyDeviceToHost,
+                                stream.value()));
+  stream.synchronize();
+  return value;
+}
+
+// A child untouched by null push-down (list subtrees are not pushed): the raw child view with
+// its own stored null metadata.
+simulated_column unpushed_child(column_view const& child)
+{
+  auto masks = std::vector<bitmask_type const*>{};
+  if (child.nullable()) { masks.push_back(child.null_mask()); }
+  auto node = simulated_column{
+    child, std::move(masks), simulated_null_count::STORED, child.offset(), child.size(), {}};
+  if (child.type().id() == type_id::STRUCT) {
+    for (auto it = child.child_begin(); it != child.child_end(); ++it) {
+      node.children.push_back(unpushed_child(*it));
+    }
+  }
+  return node;
+}
+
+// The element child of a list node, as seen by the preprocessing recursion.
+simulated_column list_element_child(simulated_column const& list_node)
+{
+  return unpushed_child(list_node.storage.child(lists_column_view::child_column_index));
+}
+
+// Mirrors cudf::detail::has_nonempty_nulls on the null-pushed view hierarchy.
+bool simulated_has_nonempty_nulls(simulated_column const& node, rmm::cuda_stream_view stream)
+{
+  auto const type = node.storage.type().id();
+  if (type != type_id::STRING && type != type_id::LIST && type != type_id::STRUCT) {
+    return false;
+  }
+  if (type == type_id::STRING || type == type_id::LIST) {
+    if (simulated_dirty_gate(node)) {
+      auto dirty = false;
+      scan_node_rows(node,
+                     0,
+                     static_cast<std::size_t>(node.size),
+                     stream,
+                     [&dirty](bool valid, int64_t offset_begin, int64_t offset_end) {
+                       dirty = dirty || (!valid && offset_end > offset_begin);
+                     });
+      if (dirty) { return true; }
+    }
+    if (type == type_id::LIST) {
+      return simulated_has_nonempty_nulls(list_element_child(node), stream);
+    }
+    return false;
+  }
+  return std::any_of(node.children.begin(), node.children.end(), [stream](auto const& child) {
+    return simulated_has_nonempty_nulls(child, stream);
+  });
+}
+
+// Mirrors structs::detail::push_down_nulls_no_sanitize: simulates the null-mask push-down for
+// struct columns and accumulates the retained mask bytes into `mask_bytes`.
+simulated_column simulate_pushed_column(column_view const& col,
+                                        std::vector<bitmask_type const*> ancestor_masks,
+                                        size_type offset,
+                                        size_type size,
+                                        std::size_t& mask_bytes)
+{
+  auto masks = std::move(ancestor_masks);
+  if (col.nullable()) { masks.push_back(col.null_mask()); }
+  auto node = simulated_column{
+    col, std::move(masks), simulated_null_count::EXACT, offset, size, {}};
+  if (col.type().id() != type_id::STRUCT) { return node; }
+
+  for (auto child_it = col.child_begin(); child_it != col.child_end(); ++child_it) {
+    auto const& child = *child_it;
+    // The pushed child shares the pushed struct's offset and size; a nullable child of a
+    // nullable struct gets a fresh ANDed mask sized on the struct's extent.
+    if (!node.validity_masks.empty() && child.nullable()) {
+      mask_bytes = reservation_checked_add(
+        mask_bytes, cudf::bitmask_allocation_size_bytes(offset + size));
+    }
+    if (child.type().id() == type_id::STRUCT) {
+      node.children.push_back(
+        simulate_pushed_column(child, node.validity_masks, offset, size, mask_bytes));
+    } else {
+      auto child_masks = node.validity_masks;
+      if (child.nullable()) { child_masks.push_back(child.null_mask()); }
+      auto const child_rule = node.validity_masks.empty() || child.nullable()
+                                ? simulated_null_count::EXACT
+                                : simulated_null_count::FORCE_CLEAN;
+      node.children.push_back(
+        simulated_column{child, std::move(child_masks), child_rule, offset, size, {}});
+    }
+  }
+  return node;
+}
+
+// Accumulates the exact identity-gather footprint of a null-pushed column, mirroring
+// cudf::detail::purge_nonempty_nulls. `rows` counts selected rows and `payload` counts valid
+// string bytes; list element children recurse over maximal runs of selected elements.
+struct purge_accumulator {
+  simulated_column node;
+  std::int64_t rows = 0;
+  std::int64_t payload = 0;
+  bool mask_retained = false;
+  std::size_t full_begin = 0;  // full local row range backing this node; for list children it
+  std::size_t full_end = 0;    // is the span the list gather masks are computed over
+  std::vector<purge_accumulator> children;  // STRUCT: per child; LIST: element child (lazy)
+};
+
+void accumulate_purged_rows(purge_accumulator& acc,
+                            std::size_t local_begin,
+                            std::size_t local_end,
+                            rmm::cuda_stream_view stream);
+
+purge_accumulator make_purge_accumulator(simulated_column node,
+                                         std::size_t full_begin,
+                                         std::size_t full_end)
+{
+  auto acc          = purge_accumulator{std::move(node)};
+  acc.full_begin    = full_begin;
+  acc.full_end      = full_end;
+  acc.mask_retained = !acc.node.validity_masks.empty();
+  if (acc.node.storage.type().id() == type_id::STRUCT) {
+    for (auto& child : acc.node.children) {
+      acc.children.push_back(make_purge_accumulator(child, full_begin, full_end));
+    }
+  }
+  return acc;
+}
+
+// Creates the accumulator for the element child of `list_acc`. A list gather drops the child's
+// null mask unless the child has nulls over the parent's full element span, so the mask gate is
+// resolved against that span rather than the selected elements.
+purge_accumulator make_list_element_accumulator(purge_accumulator const& list_acc,
+                                                rmm::cuda_stream_view stream)
+{
+  auto const& parent = list_acc.node;
+  auto const offsets_child = lists_column_view{parent.storage}.offsets();
+  auto const base          = static_cast<std::size_t>(parent.offset);
+  auto const span_begin = static_cast<std::size_t>(
+    read_offset_value<int32_t>(offsets_child, base + list_acc.full_begin, stream));
+  auto const span_end = static_cast<std::size_t>(
+    read_offset_value<int32_t>(offsets_child, base + list_acc.full_end, stream));
+  auto acc           = make_purge_accumulator(list_element_child(parent), span_begin, span_end);
+  acc.mask_retained = std::any_of(
+    acc.node.validity_masks.begin(),
+    acc.node.validity_masks.end(),
+    [&](bitmask_type const* mask) {
+      return mask_has_unset_bits(mask,
+                                 static_cast<std::size_t>(acc.node.offset) + span_begin,
+                                 static_cast<std::size_t>(acc.node.offset) + span_end,
+                                 stream);
+    });
+  return acc;
+}
+
+void accumulate_purged_rows(purge_accumulator& acc,
+                            std::size_t local_begin,
+                            std::size_t local_end,
+                            rmm::cuda_stream_view stream)
+{
+  if (local_begin >= local_end) { return; }
+  auto const type = acc.node.storage.type().id();
+  acc.rows += static_cast<std::int64_t>(local_end - local_begin);
+  if (type == type_id::STRUCT) {
+    for (auto& child : acc.children) {
+      accumulate_purged_rows(child, local_begin, local_end, stream);
+    }
+    return;
+  }
+  if (type != type_id::STRING && type != type_id::LIST) { return; }
+
+  auto run_open  = false;
+  std::size_t run_begin = 0;
+  std::size_t run_end   = 0;
+  auto const flush_run  = [&] {
+    if (!run_open) { return; }
+    if (acc.children.empty()) {
+      acc.children.push_back(make_list_element_accumulator(acc, stream));
+    }
+    accumulate_purged_rows(acc.children.front(), run_begin, run_end, stream);
+    run_open = false;
+  };
+  scan_node_rows(
+    acc.node, local_begin, local_end, stream, [&](bool valid, int64_t offset_begin, int64_t offset_end) {
+      if (valid) {
+        acc.payload += offset_end - offset_begin;
+        if (type == type_id::LIST) {
+          if (run_open && static_cast<std::size_t>(offset_begin) == run_end) {
+            run_end = static_cast<std::size_t>(offset_end);
+          } else {
+            flush_run();
+            run_begin = static_cast<std::size_t>(offset_begin);
+            run_end   = static_cast<std::size_t>(offset_end);
+            run_open  = true;
+          }
+        }
+      } else if (type == type_id::LIST) {
+        flush_run();
+      }
+    });
+  flush_run();
+}
+
+std::size_t finalize_purged_column(purge_accumulator const& acc)
+{
+  if (acc.rows == 0) { return 0; }
+  auto const rows  = static_cast<std::size_t>(acc.rows);
+  auto const bytes = acc.mask_retained ? cudf::bitmask_allocation_size_bytes(acc.rows) : 0;
+  auto const type  = acc.node.storage.type().id();
+  if (type == type_id::STRING) {
+    auto const offset_width =
+      acc.payload >= cudf::strings::get_offset64_threshold() ? sizeof(int64_t) : sizeof(int32_t);
+    return reservation_checked_add(
+      bytes,
+      reservation_checked_add(reservation_checked_mul(rows + 1, offset_width),
+                              static_cast<std::size_t>(acc.payload)));
+  }
+  if (type == type_id::LIST) {
+    auto const child_bytes = acc.children.empty() ? 0 : finalize_purged_column(acc.children.front());
+    return reservation_checked_add(
+      bytes, reservation_checked_add(reservation_checked_mul(rows + 1, sizeof(int32_t)), child_bytes));
+  }
+  if (type == type_id::STRUCT) {
+    auto total = bytes;
+    for (auto const& child : acc.children) {
+      total = reservation_checked_add(total, finalize_purged_column(child));
+    }
+    return total;
+  }
+  return reservation_checked_add(
+    bytes,
+    reservation_checked_mul(rows, cudf::size_of(acc.node.storage.type())));
+}
+
+std::size_t retained_preprocessing_reservation_size(column_view const& col,
+                                                    rmm::cuda_stream_view stream)
+{
+  auto mask_bytes = std::size_t{0};
+  auto root       = [&] {
+    if (col.type().id() == type_id::STRUCT) {
+      return simulate_pushed_column(col, {}, col.offset(), col.size(), mask_bytes);
+    }
+    auto masks = std::vector<bitmask_type const*>{};
+    if (col.nullable()) { masks.push_back(col.null_mask()); }
+    return simulated_column{
+      col, std::move(masks), simulated_null_count::STORED, col.offset(), col.size(), {}};
+  }();
+  if (!simulated_has_nonempty_nulls(root, stream)) { return mask_bytes; }
+
+  auto acc = make_purge_accumulator(root, 0, static_cast<std::size_t>(root.size));
+  accumulate_purged_rows(acc, 0, static_cast<std::size_t>(root.size), stream);
+  return finalize_purged_column(acc);
+}
+
+}  // namespace
+
 std::shared_ptr<preprocessed_table> preprocessed_table::create(table_view const& t,
                                                                rmm::cuda_stream_view stream,
                                                                rmm::device_async_resource_ref mr)
@@ -857,6 +1292,28 @@ std::shared_ptr<preprocessed_table> preprocessed_table::create(table_view const&
   auto d_t = table_device_view_owner(table_device_view::create(verticalized_t, stream, mr));
   return std::shared_ptr<preprocessed_table>(new preprocessed_table(
     std::move(d_t), std::move(nullable_data.new_null_masks), std::move(nullable_data.new_columns)));
+}
+
+std::size_t preprocessed_table::create_reservation_size(table_view const& t,
+                                                        rmm::cuda_stream_view stream)
+{
+  check_eq_compatibility(t);
+
+  // The verticalized schema is a host-side function of the input schema: null push-down only
+  // rewrites masks, and sanitation replaces a column with an identical-schema copy.
+  auto const struct_offset_removed_table = remove_struct_child_offsets(t);
+  auto const verticalized_t =
+    std::get<0>(decompose_structs(struct_offset_removed_table, decompose_lists_column::YES));
+  auto bytes = std::accumulate(verticalized_t.begin(),
+                               verticalized_t.end(),
+                               std::size_t{alignof(column_device_view) - 1},
+                               [](std::size_t init, column_view const& col) {
+                                 return reservation_checked_add(init, column_device_view::extent(col));
+                               });
+  for (auto const& col : t) {
+    bytes = reservation_checked_add(bytes, retained_preprocessing_reservation_size(col, stream));
+  }
+  return bytes;
 }
 
 two_table_comparator::two_table_comparator(table_view const& left,

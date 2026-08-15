@@ -31,9 +31,14 @@
 #include <cuco/operator.hpp>
 #include <cuco/static_set_ref.cuh>
 #include <cuda/iterator>
+#include <thrust/copy.h>
+#include <thrust/count.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/sequence.h>
 
+#include <limits>
 #include <memory>
+#include <stdexcept>
 
 namespace cudf {
 namespace detail {
@@ -49,8 +54,8 @@ namespace {
  * @param stream CUDA stream used for device memory operations and kernel launches
  * @return A pair of pointer to the output bitmask and the buffer containing the bitmask
  */
-std::pair<rmm::device_buffer, bitmask_type const*> build_row_bitmask(table_view const& input,
-                                                                     rmm::cuda_stream_view stream)
+std::pair<rmm::device_buffer, bitmask_type const*> build_row_bitmask(
+  table_view const& input, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
 {
   auto const nullable_columns = get_nullable_columns(input);
   CUDF_EXPECTS(nullable_columns.size() > 0,
@@ -60,14 +65,12 @@ std::pair<rmm::device_buffer, bitmask_type const*> build_row_bitmask(table_view 
   // Otherwise, we have only one nullable column and can use its null mask directly.
   if (nullable_columns.size() > 1) {
     auto row_bitmask =
-      cudf::detail::bitmask_and(
-        table_view{nullable_columns}, stream, cudf::get_current_device_resource_ref())
-        .first;
+      cudf::detail::bitmask_and(table_view{nullable_columns}, stream, mr).first;
     auto const row_bitmask_ptr = static_cast<bitmask_type const*>(row_bitmask.data());
     return std::pair(std::move(row_bitmask), row_bitmask_ptr);
   }
 
-  return std::pair(rmm::device_buffer{0, stream}, nullable_columns.front().null_mask());
+  return std::pair(rmm::device_buffer{0, stream, mr}, nullable_columns.front().null_mask());
 }
 
 struct gather_mask {
@@ -77,6 +80,85 @@ struct gather_mask {
   {
     return flagged[idx] == (kind == join_kind::LEFT_SEMI_JOIN);
   }
+};
+
+std::size_t checked_add(std::size_t lhs, std::size_t rhs)
+{
+  CUDF_EXPECTS(lhs <= std::numeric_limits<std::size_t>::max() - rhs,
+               "filtered join pre-build reservation size overflow",
+               std::overflow_error);
+  return lhs + rhs;
+}
+
+std::size_t checked_mul(std::size_t lhs, std::size_t rhs)
+{
+  CUDF_EXPECTS(rhs == 0 || lhs <= std::numeric_limits<std::size_t>::max() / rhs,
+               "filtered join pre-build reservation size overflow",
+               std::overflow_error);
+  return lhs * rhs;
+}
+
+class contains_map_filtered_join_probe_state : public cudf::detail::filtered_join_probe_state {
+ public:
+  contains_map_filtered_join_probe_state(join_kind kind,
+                                         cudf::size_type left_rows,
+                                         cudf::size_type output_size,
+                                         rmm::device_uvector<bool> contains_map)
+    : _kind{kind},
+      _left_rows{left_rows},
+      _output_size{output_size},
+      _contains_map{std::move(contains_map)}
+  {
+  }
+
+  [[nodiscard]] cudf::size_type output_size() const override { return _output_size; }
+
+  [[nodiscard]] std::size_t device_allocated_size_bytes() const override
+  {
+    return _contains_map.capacity() * sizeof(bool);
+  }
+
+  [[nodiscard]] std::unique_ptr<rmm::device_uvector<cudf::size_type>> materialize_indices(
+    rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const override
+  {
+    rmm::device_uvector<cudf::size_type> gather_map(_output_size, stream, mr);
+    thrust::copy_if(rmm::exec_policy_nosync(stream, mr),
+                    thrust::counting_iterator<cudf::size_type>(0),
+                    thrust::counting_iterator<cudf::size_type>(_left_rows),
+                    gather_map.begin(),
+                    gather_mask{_kind, _contains_map});
+    return std::make_unique<rmm::device_uvector<cudf::size_type>>(std::move(gather_map));
+  }
+
+ private:
+  join_kind _kind;
+  cudf::size_type _left_rows;
+  cudf::size_type _output_size;
+  rmm::device_uvector<bool> _contains_map;
+};
+
+class sequence_filtered_join_probe_state : public cudf::detail::filtered_join_probe_state {
+ public:
+  explicit sequence_filtered_join_probe_state(cudf::size_type output_size)
+    : _output_size{output_size}
+  {
+  }
+
+  [[nodiscard]] cudf::size_type output_size() const override { return _output_size; }
+
+  [[nodiscard]] std::size_t device_allocated_size_bytes() const override { return 0; }
+
+  [[nodiscard]] std::unique_ptr<rmm::device_uvector<cudf::size_type>> materialize_indices(
+    rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const override
+  {
+    auto result =
+      std::make_unique<rmm::device_uvector<cudf::size_type>>(_output_size, stream, mr);
+    thrust::sequence(rmm::exec_policy_nosync(stream, mr), result->begin(), result->end());
+    return result;
+  }
+
+ private:
+  cudf::size_type _output_size;
 };
 
 }  // namespace
@@ -96,7 +178,9 @@ auto filtered_join::compute_bucket_storage_size(cudf::table_view tbl, double loa
 }
 
 template <int32_t CGSize, typename Ref>
-void filtered_join::insert_right_table(Ref const& insert_ref, rmm::cuda_stream_view stream)
+void filtered_join::insert_right_table(Ref const& insert_ref,
+                                       rmm::cuda_stream_view stream,
+                                       rmm::device_async_resource_ref mr)
 {
   cudf::scoped_range range{"distinct_filtered_join::insert_right_table"};
   auto insert = [&]<typename Iterator>(Iterator right_iter) {
@@ -104,7 +188,7 @@ void filtered_join::insert_right_table(Ref const& insert_ref, rmm::cuda_stream_v
     auto const grid_size = cuco::detail::grid_size(_right.num_rows(), CGSize);
 
     if (cudf::has_nested_nulls(_right) && _nulls_equal == null_equality::UNEQUAL) {
-      auto const bitmask_buffer_and_ptr = build_row_bitmask(_right, stream);
+      auto const bitmask_buffer_and_ptr = build_row_bitmask(_right, stream, mr);
       auto const row_bitmask_ptr        = bitmask_buffer_and_ptr.second;
       cuco::detail::open_addressing_ns::insert_if_n<CGSize, cuco::detail::default_block_size()>
         <<<grid_size, cuco::detail::default_block_size(), 0, stream.value()>>>(
@@ -163,11 +247,12 @@ std::unique_ptr<rmm::device_uvector<cudf::size_type>> distinct_filtered_join::qu
                     left,
                     left_has_nulls,
                     query_ref,
-                    stream]<typename InputLeftIterator, typename OutputContainsIterator>(
+                    stream,
+                    mr]<typename InputLeftIterator, typename OutputContainsIterator>(
                      InputLeftIterator left_iter, OutputContainsIterator contains_iter) {
     auto const grid_size = cuco::detail::grid_size(left.num_rows(), CGSize);
     if (left_has_nulls && _nulls_equal == null_equality::UNEQUAL) {
-      auto const bitmask_buffer_and_ptr = build_row_bitmask(left, stream);
+      auto const bitmask_buffer_and_ptr = build_row_bitmask(left, stream, mr);
       auto const row_bitmask_ptr        = bitmask_buffer_and_ptr.second;
       cuco::detail::open_addressing_ns::contains_if_n<CGSize, cuco::detail::default_block_size()>
         <<<grid_size, cuco::detail::default_block_size(), 0, stream.value()>>>(
@@ -191,7 +276,7 @@ std::unique_ptr<rmm::device_uvector<cudf::size_type>> distinct_filtered_join::qu
     }
   };
 
-  auto contains_map = rmm::device_uvector<bool>(left.num_rows(), stream);
+  auto contains_map = rmm::device_uvector<bool>(left.num_rows(), stream, mr);
   if (is_primitive_row_op_compatible(_right)) {
     auto const d_left_hasher = primitive_row_hasher{nullate::DYNAMIC{true}, preprocessed_left};
     auto const left_iter     = cudf::detail::make_counting_transform_iterator(
@@ -207,37 +292,124 @@ std::unique_ptr<rmm::device_uvector<cudf::size_type>> distinct_filtered_join::qu
     query_set(left_iter, contains_map.begin());
   }
   rmm::device_uvector<size_type> gather_map(left.num_rows(), stream, mr);
-  auto gather_map_end =
-    thrust::copy_if(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-                    cuda::counting_iterator<size_type>{0},
-                    cuda::counting_iterator<size_type>{left.num_rows()},
-                    gather_map.begin(),
-                    gather_mask{kind, contains_map});
+  auto gather_map_end = thrust::copy_if(rmm::exec_policy_nosync(stream, mr),
+                                        cuda::counting_iterator<size_type>{0},
+                                        cuda::counting_iterator<size_type>{left.num_rows()},
+                                        gather_map.begin(),
+                                        gather_mask{kind, contains_map});
   gather_map.resize(cuda::std::distance(gather_map.begin(), gather_map_end), stream);
   return std::make_unique<rmm::device_uvector<size_type>>(std::move(gather_map));
+}
+
+template <int32_t CGSize, typename Ref>
+std::unique_ptr<cudf::detail::filtered_join_probe_state>
+distinct_filtered_join::begin_query_right_table_probe(
+  cudf::table_view const& left,
+  std::shared_ptr<cudf::detail::row::equality::preprocessed_table> preprocessed_left,
+  join_kind kind,
+  Ref query_ref,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  cudf::scoped_range range{"distinct_filtered_join::begin_query_right_table_probe"};
+  auto const left_has_nulls = has_nested_nulls(left);
+
+  auto query_set = [this,
+                    left,
+                    left_has_nulls,
+                    query_ref,
+                    stream,
+                    mr]<typename InputLeftIterator, typename OutputContainsIterator>(
+                     InputLeftIterator left_iter, OutputContainsIterator contains_iter) {
+    auto const grid_size = cuco::detail::grid_size(left.num_rows(), CGSize);
+    if (left_has_nulls && _nulls_equal == null_equality::UNEQUAL) {
+      auto const bitmask_buffer_and_ptr = build_row_bitmask(left, stream, mr);
+      auto const row_bitmask_ptr        = bitmask_buffer_and_ptr.second;
+      cuco::detail::open_addressing_ns::contains_if_n<CGSize, cuco::detail::default_block_size()>
+        <<<grid_size, cuco::detail::default_block_size(), 0, stream.value()>>>(
+          left_iter,
+          left.num_rows(),
+          cuda::counting_iterator<size_type>{0},
+          row_is_valid{row_bitmask_ptr},
+          contains_iter,
+          query_ref);
+      CUDF_CUDA_TRY(cudaGetLastError());
+    } else {
+      cuco::detail::open_addressing_ns::contains_if_n<CGSize, cuco::detail::default_block_size()>
+        <<<grid_size, cuco::detail::default_block_size(), 0, stream.value()>>>(
+          left_iter,
+          left.num_rows(),
+          cuda::constant_iterator<bool>{true},
+          cuda::std::identity{},
+          contains_iter,
+          query_ref);
+      CUDF_CUDA_TRY(cudaGetLastError());
+    }
+  };
+
+  auto contains_map = rmm::device_uvector<bool>(left.num_rows(), stream, mr);
+  if (is_primitive_row_op_compatible(_right)) {
+    auto const d_left_hasher = primitive_row_hasher{nullate::DYNAMIC{true}, preprocessed_left};
+    auto const left_iter     = cudf::detail::make_counting_transform_iterator(
+      size_type{0}, key_pair_fn<rhs_index_type, primitive_row_hasher>{d_left_hasher});
+
+    query_set(left_iter, contains_map.begin());
+  } else {
+    auto const d_left_hasher =
+      cudf::detail::row::hash::row_hasher{preprocessed_left}.device_hasher(nullate::YES{});
+    auto const left_iter = cudf::detail::make_counting_transform_iterator(
+      size_type{0}, key_pair_fn<rhs_index_type, row_hasher>{d_left_hasher});
+
+    query_set(left_iter, contains_map.begin());
+  }
+
+  auto const output_size = static_cast<cudf::size_type>(
+    thrust::count_if(rmm::exec_policy_nosync(stream, mr),
+                     thrust::counting_iterator<cudf::size_type>(0),
+                     thrust::counting_iterator<cudf::size_type>(left.num_rows()),
+                     gather_mask{kind, contains_map}));
+  return std::make_unique<contains_map_filtered_join_probe_state>(
+    kind, left.num_rows(), output_size, std::move(contains_map));
 }
 
 filtered_join::filtered_join(cudf::table_view const& right,
                              cudf::null_equality compare_nulls,
                              double load_factor,
-                             rmm::cuda_stream_view stream)
+                             rmm::cuda_stream_view stream,
+                             rmm::device_async_resource_ref mr)
   : _right_props{right_properties{cudf::has_nested_columns(right)}},
     _nulls_equal{compare_nulls},
     _right{right},
-    _preprocessed_right{cudf::detail::row::equality::preprocessed_table::create(_right, stream)},
+    _preprocessed_right{cudf::detail::row::equality::preprocessed_table::create(_right, stream, mr)},
     _bucket_storage{cuco::extent<std::size_t>{compute_bucket_storage_size(right, load_factor)},
-                    rmm::mr::polymorphic_allocator<char>{},
+                    rmm::mr::polymorphic_allocator<char>{mr},
                     stream.value()}
 {
   if (_right.num_rows() == 0) return;
   _bucket_storage.initialize(empty_sentinel_key, stream);
 }
 
+std::size_t filtered_join::retained_reservation_size(cudf::table_view const& right,
+                                                     double load_factor,
+                                                     rmm::cuda_stream_view stream)
+{
+  // cuco::bucket_storage allocates `capacity + extra` slots, where `extra` covers the
+  // storage-ref alignment padding.
+  auto const capacity    = static_cast<std::size_t>(compute_bucket_storage_size(right, load_factor));
+  constexpr auto alignment = storage_type::ref_type::alignment;
+  constexpr auto extra     = (alignment - 1) / sizeof(key) + 1;
+  auto const bucket_bytes  = checked_mul(checked_add(capacity, extra), sizeof(key));
+  auto const preprocessing_bytes =
+    cudf::detail::row::equality::preprocessed_table::create_reservation_size(right, stream);
+  return checked_add(bucket_bytes, preprocessing_bytes);
+}
+
 distinct_filtered_join::distinct_filtered_join(cudf::table_view const& right,
                                                cudf::null_equality compare_nulls,
                                                double load_factor,
-                                               rmm::cuda_stream_view stream)
-  : filtered_join(right, compare_nulls, load_factor, stream)
+                                               rmm::cuda_stream_view stream,
+                                               rmm::device_async_resource_ref mr)
+  : filtered_join(right, compare_nulls, load_factor, stream, mr)
 {
   cudf::scoped_range range{"distinct_filtered_join::distinct_filtered_join"};
   if (_right.num_rows() == 0) return;
@@ -255,7 +427,7 @@ distinct_filtered_join::distinct_filtered_join(cudf::table_view const& right,
                                  cuco::thread_scope_device,
                                  _bucket_storage.ref()};
     auto insert_ref = set_ref.rebind_operators(cuco::insert);
-    insert_right_table<primitive_probing_scheme::cg_size>(insert_ref, stream);
+    insert_right_table<primitive_probing_scheme::cg_size>(insert_ref, stream, mr);
   } else if (_right_props.has_nested_columns) {
     auto const d_right_comparator =
       cudf::detail::row::equality::self_comparator{_preprocessed_right}.equal_to<true>(
@@ -268,7 +440,7 @@ distinct_filtered_join::distinct_filtered_join(cudf::table_view const& right,
                                  cuco::thread_scope_device,
                                  _bucket_storage.ref()};
     auto insert_ref = set_ref.rebind_operators(cuco::insert);
-    insert_right_table<nested_probing_scheme::cg_size>(insert_ref, stream);
+    insert_right_table<nested_probing_scheme::cg_size>(insert_ref, stream, mr);
   } else {
     auto const d_right_comparator =
       cudf::detail::row::equality::self_comparator{_preprocessed_right}.equal_to<false>(
@@ -281,7 +453,7 @@ distinct_filtered_join::distinct_filtered_join(cudf::table_view const& right,
                                  cuco::thread_scope_device,
                                  _bucket_storage.ref()};
     auto insert_ref = set_ref.rebind_operators(cuco::insert);
-    insert_right_table<simple_probing_scheme::cg_size>(insert_ref, stream);
+    insert_right_table<simple_probing_scheme::cg_size>(insert_ref, stream, mr);
   }
 }
 
@@ -293,9 +465,9 @@ std::unique_ptr<rmm::device_uvector<cudf::size_type>> distinct_filtered_join::se
 {
   cudf::scoped_range range{"distinct_filtered_join::semi_anti_join"};
 
-  auto const preprocessed_left = [&left, stream] {
+  auto const preprocessed_left = [&left, stream, mr] {
     cudf::scoped_range range{"distinct_filtered_join::semi_anti_join::preprocessed_left"};
-    return cudf::detail::row::equality::preprocessed_table::create(left, stream);
+    return cudf::detail::row::equality::preprocessed_table::create(left, stream, mr);
   }();
 
   if (is_primitive_row_op_compatible(_right)) {
@@ -365,49 +537,194 @@ std::unique_ptr<rmm::device_uvector<cudf::size_type>> distinct_filtered_join::an
   if (_right.num_rows() == 0) {
     auto result =
       std::make_unique<rmm::device_uvector<cudf::size_type>>(left.num_rows(), stream, mr);
-    thrust::sequence(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-                     result->begin(),
-                     result->end());
+    thrust::sequence(rmm::exec_policy_nosync(stream, mr), result->begin(), result->end());
     return result;
   }
 
   return semi_anti_join(left, join_kind::LEFT_ANTI_JOIN, stream, mr);
 }
 
+std::unique_ptr<cudf::detail::filtered_join_probe_state>
+distinct_filtered_join::semi_anti_probe_state(cudf::table_view const& left,
+                                              join_kind kind,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  cudf::scoped_range range{"distinct_filtered_join::semi_anti_probe_state"};
+
+  auto const preprocessed_left = [&left, stream, mr] {
+    cudf::scoped_range range{"distinct_filtered_join::semi_anti_probe_state::preprocessed_left"};
+    return cudf::detail::row::equality::preprocessed_table::create(left, stream, mr);
+  }();
+
+  if (is_primitive_row_op_compatible(_right)) {
+    auto const d_right_left_comparator = primitive_row_comparator{
+      nullate::DYNAMIC{true}, _preprocessed_right, preprocessed_left, _nulls_equal};
+
+    cuco::static_set_ref set_ref{empty_sentinel_key,
+                                 comparator_adapter{d_right_left_comparator},
+                                 primitive_probing_scheme{},
+                                 cuco::thread_scope_device,
+                                 _bucket_storage.ref()};
+    auto query_ref = set_ref.rebind_operators(cuco::op::contains);
+    return begin_query_right_table_probe<primitive_probing_scheme::cg_size>(
+      left, preprocessed_left, kind, query_ref, stream, mr);
+  } else {
+    auto const d_right_left_comparator =
+      cudf::detail::row::equality::two_table_comparator{_preprocessed_right, preprocessed_left};
+
+    if (_right_props.has_nested_columns) {
+      auto d_right_left_nan_comparator = d_right_left_comparator.equal_to<true>(
+        nullate::YES{},
+        _nulls_equal,
+        cudf::detail::row::equality::nan_equal_physical_equality_comparator{});
+      cuco::static_set_ref set_ref{empty_sentinel_key,
+                                   comparator_adapter{d_right_left_nan_comparator},
+                                   nested_probing_scheme{},
+                                   cuco::thread_scope_device,
+                                   _bucket_storage.ref()};
+      auto query_ref = set_ref.rebind_operators(cuco::op::contains);
+      return begin_query_right_table_probe<nested_probing_scheme::cg_size>(
+        left, preprocessed_left, kind, query_ref, stream, mr);
+    } else {
+      auto d_right_left_nan_comparator = d_right_left_comparator.equal_to<false>(
+        nullate::YES{},
+        _nulls_equal,
+        cudf::detail::row::equality::nan_equal_physical_equality_comparator{});
+      cuco::static_set_ref set_ref{empty_sentinel_key,
+                                   comparator_adapter{d_right_left_nan_comparator},
+                                   simple_probing_scheme{},
+                                   cuco::thread_scope_device,
+                                   _bucket_storage.ref()};
+      auto query_ref = set_ref.rebind_operators(cuco::op::contains);
+      return begin_query_right_table_probe<simple_probing_scheme::cg_size>(
+        left, preprocessed_left, kind, query_ref, stream, mr);
+    }
+  }
+}
+
+std::unique_ptr<cudf::detail::filtered_join_probe_state>
+distinct_filtered_join::begin_left_semi_probe(cudf::table_view const& left,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  if (_right.num_rows() == 0 || left.num_rows() == 0) {
+    return std::make_unique<sequence_filtered_join_probe_state>(0);
+  }
+
+  return semi_anti_probe_state(left, join_kind::LEFT_SEMI_JOIN, stream, mr);
+}
+
+std::unique_ptr<cudf::detail::filtered_join_probe_state>
+distinct_filtered_join::begin_left_anti_probe(cudf::table_view const& left,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  if (left.num_rows() == 0) { return std::make_unique<sequence_filtered_join_probe_state>(0); }
+  if (_right.num_rows() == 0) {
+    return std::make_unique<sequence_filtered_join_probe_state>(left.num_rows());
+  }
+
+  return semi_anti_probe_state(left, join_kind::LEFT_ANTI_JOIN, stream, mr);
+}
+
 }  // namespace detail
+
+filtered_join_probe_state::~filtered_join_probe_state() = default;
+
+filtered_join_probe_state::filtered_join_probe_state(
+  std::unique_ptr<cudf::detail::filtered_join_probe_state> impl)
+  : _impl{std::move(impl)}
+{
+}
+
+size_type filtered_join_probe_state::output_size() const { return _impl->output_size(); }
+
+std::size_t filtered_join_probe_state::device_allocated_size_bytes() const
+{
+  return _impl->device_allocated_size_bytes();
+}
+
+std::unique_ptr<rmm::device_uvector<size_type>> filtered_join_probe_state::materialize_indices(
+  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+{
+  return _impl->materialize_indices(stream, mr);
+}
 
 filtered_join::~filtered_join() = default;
 
-filtered_join::filtered_join(cudf::table_view const& build,
+filtered_join::filtered_join(cudf::table_view const& right,
+                             null_equality compare_nulls,
+                             double load_factor,
+                             rmm::cuda_stream_view stream,
+                             rmm::device_async_resource_ref mr)
+  : _impl{std::make_unique<cudf::detail::distinct_filtered_join>(
+      right, compare_nulls, load_factor, stream, mr)}
+{
+}
+
+filtered_join::filtered_join(cudf::table_view const& right,
                              null_equality compare_nulls,
                              double load_factor,
                              rmm::cuda_stream_view stream)
-  : _impl{std::make_unique<cudf::detail::distinct_filtered_join>(
-      build, compare_nulls, load_factor, stream)}
+  : filtered_join(
+      right, compare_nulls, load_factor, stream, cudf::get_current_device_resource_ref())
 {
 }
 
-filtered_join::filtered_join(cudf::table_view const& build,
+filtered_join::filtered_join(cudf::table_view const& right,
                              null_equality compare_nulls,
                              rmm::cuda_stream_view stream)
-  : filtered_join(build, compare_nulls, cudf::detail::CUCO_DESIRED_LOAD_FACTOR, stream)
+  : filtered_join(right, compare_nulls, cudf::detail::CUCO_DESIRED_LOAD_FACTOR, stream)
 {
+}
+
+std::size_t filtered_join::pre_build_reservation_size(
+  cudf::table_view const& right,
+  double load_factor,
+  rmm::cuda_stream_view stream,
+  [[maybe_unused]] rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(
+    0 != right.num_columns(), "Filtered join right table is empty", std::invalid_argument);
+  CUDF_EXPECTS(load_factor > 0 && load_factor <= 1,
+               "Invalid load factor: must be greater than 0 and less than or equal to 1.",
+               std::invalid_argument);
+  return cudf::detail::filtered_join::retained_reservation_size(right, load_factor, stream);
 }
 
 std::unique_ptr<rmm::device_uvector<size_type>> filtered_join::semi_join(
-  cudf::table_view const& probe,
+  cudf::table_view const& left,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
-  return _impl->semi_join(probe, stream, mr);
+  return _impl->semi_join(left, stream, mr);
 }
 
 std::unique_ptr<rmm::device_uvector<size_type>> filtered_join::anti_join(
-  cudf::table_view const& probe,
+  cudf::table_view const& left,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
-  return _impl->anti_join(probe, stream, mr);
+  return _impl->anti_join(left, stream, mr);
+}
+
+std::unique_ptr<filtered_join_probe_state> filtered_join::begin_left_semi_probe(
+  cudf::table_view const& left,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
+  return std::unique_ptr<filtered_join_probe_state>{
+    new filtered_join_probe_state{_impl->begin_left_semi_probe(left, stream, mr)}};
+}
+
+std::unique_ptr<filtered_join_probe_state> filtered_join::begin_left_anti_probe(
+  cudf::table_view const& left,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
+  return std::unique_ptr<filtered_join_probe_state>{
+    new filtered_join_probe_state{_impl->begin_left_anti_probe(left, stream, mr)}};
 }
 
 }  // namespace cudf

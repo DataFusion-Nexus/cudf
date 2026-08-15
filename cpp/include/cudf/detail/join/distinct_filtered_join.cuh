@@ -45,6 +45,21 @@ class distinct_filtered_join : public filtered_join {
     rmm::device_async_resource_ref mr);
 
   /**
+   * @brief Begins either a semi or anti retained probe based on the specified kind
+   *
+   * @param left The left table to probe the hash table with
+   * @param kind The kind of probe to begin (SEMI or ANTI)
+   * @param stream CUDA stream on which to perform operations
+   * @param mr Memory resource for the retained probe state
+   * @return Retained probe state holding the membership result
+   */
+  std::unique_ptr<cudf::detail::filtered_join_probe_state> semi_anti_probe_state(
+    cudf::table_view const& left,
+    join_kind kind,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+  /**
    * @brief Core implementation for querying the hash table
    *
    * Performs the actual hash table query operation for both semi and anti joins
@@ -69,6 +84,31 @@ class distinct_filtered_join : public filtered_join {
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
+  /**
+   * @brief Core implementation for beginning a retained semi/anti probe
+   *
+   * Queries the hash table once and retains the membership map for later
+   * materialization.
+   *
+   * @tparam CGSize CUDA cooperative group size
+   * @tparam Ref Reference type for the hash table
+   * @param left The left table to probe the hash table with
+   * @param preprocessed_left Preprocessed left table for row operators
+   * @param kind The kind of probe to begin
+   * @param query_ref Reference to the hash table for querying
+   * @param stream CUDA stream on which to perform operations
+   * @param mr Memory resource for the retained probe state
+   * @return Retained probe state holding the membership result
+   */
+  template <int32_t CGSize, typename Ref>
+  std::unique_ptr<cudf::detail::filtered_join_probe_state> begin_query_right_table_probe(
+    cudf::table_view const& left,
+    std::shared_ptr<cudf::detail::row::equality::preprocessed_table> preprocessed_left,
+    join_kind kind,
+    Ref query_ref,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
  public:
   /**
    * @brief Constructor for filtered join with set
@@ -77,11 +117,13 @@ class distinct_filtered_join : public filtered_join {
    * @param compare_nulls How null values should be compared
    * @param load_factor Target load factor for the hash table
    * @param stream CUDA stream on which to perform operations
+   * @param mr Device memory resource used for the retained hash table and preprocessing state
    */
   distinct_filtered_join(cudf::table_view const& right,
                          cudf::null_equality compare_nulls,
                          double load_factor,
-                         rmm::cuda_stream_view stream);
+                         rmm::cuda_stream_view stream,
+                         rmm::device_async_resource_ref mr);
 
   /**
    * @brief Implementation of semi join for set
@@ -109,6 +151,38 @@ class distinct_filtered_join : public filtered_join {
    * @return Device vector of indices representing the join result
    */
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> anti_join(
+    cudf::table_view const& left,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) override;
+
+  /**
+   * @brief Begins a retained left-semi probe
+   *
+   * Probes the hash table once and retains the membership state needed to later
+   * materialize the selected left-row indices.
+   *
+   * @param left The left table to probe the hash table with
+   * @param stream CUDA stream on which to perform operations
+   * @param mr Memory resource for the retained probe state
+   * @return Retained probe state holding the membership result
+   */
+  std::unique_ptr<cudf::detail::filtered_join_probe_state> begin_left_semi_probe(
+    cudf::table_view const& left,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) override;
+
+  /**
+   * @brief Begins a retained left-anti probe
+   *
+   * Probes the hash table once and retains the membership state needed to later
+   * materialize the rejected left-row indices.
+   *
+   * @param left The left table to probe the hash table with
+   * @param stream CUDA stream on which to perform operations
+   * @param mr Memory resource for the retained probe state
+   * @return Retained probe state holding the membership result
+   */
+  std::unique_ptr<cudf::detail::filtered_join_probe_state> begin_left_anti_probe(
     cudf::table_view const& left,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) override;
