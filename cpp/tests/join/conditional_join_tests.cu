@@ -5,6 +5,7 @@
 
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_wrapper.hpp>
+#include <cudf_test/memory_resource_utilities.hpp>
 #include <cudf_test/type_lists.hpp>
 
 #include <cudf/ast/expressions.hpp>
@@ -15,9 +16,13 @@
 #include <cudf/join/join.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 
+#include <rmm/cuda_stream.hpp>
 #include <rmm/exec_policy.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
+#include <cuda_runtime_api.h>
 #include <thrust/equal.h>
 #include <thrust/sort.h>
 #include <thrust/transform.h>
@@ -265,6 +270,10 @@ struct ConditionalJoinPairReturnTest : public ConditionalJoinTest<T> {
    */
   void _compare_to_hash_join(PairJoinReturn const& result, PairJoinReturn const& reference)
   {
+    ASSERT_EQ(result.first->size(), result.second->size());
+    ASSERT_EQ(reference.first->size(), reference.second->size());
+    ASSERT_EQ(result.first->size(), reference.first->size());
+
     auto result_pairs =
       rmm::device_uvector<index_pair>(result.first->size(), cudf::get_default_stream());
     auto reference_pairs =
@@ -686,6 +695,188 @@ TYPED_TEST(ConditionalFullJoinTest, TestTwoColumnThreeRowSomeEqual)
              left_zero_eq_right_zero,
              {{0, 0}, {1, 1}, {2, cudf::JoinNoMatch}, {cudf::JoinNoMatch, 2}});
 };
+
+TYPED_TEST(ConditionalFullJoinTest, RetainedSizeDataMaterializesFullJoin)
+{
+  auto [left_wrappers, right_wrappers, left_columns, right_columns, left, right] =
+    this->parse_input(ColumnVector<TypeParam>{{0, 1, 2}}, ColumnVector<TypeParam>{{0, 1, 3}});
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  auto retained =
+    cudf::conditional_full_join_size(left, right, left_zero_eq_right_zero, stream, mr);
+  EXPECT_EQ(retained->output_size(), 4);
+
+  auto retained_indices  = retained->materialize_indices(stream, mr);
+  auto immediate_indices = cudf::conditional_full_join(left, right, left_zero_eq_right_zero);
+  this->_compare_to_hash_join(retained_indices, immediate_indices);
+}
+
+TYPED_TEST(ConditionalFullJoinTest, RetainedSizeDataHandlesEmptyInputs)
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  {
+    auto [left_wrappers, right_wrappers, left_columns, right_columns, left, right] =
+      this->parse_input(ColumnVector<TypeParam>{{}}, ColumnVector<TypeParam>{{3, 4, 5}});
+
+    auto retained =
+      cudf::conditional_full_join_size(left, right, left_zero_eq_right_zero, stream, mr);
+    EXPECT_EQ(retained->output_size(), 3);
+
+    auto retained_indices  = retained->materialize_indices(stream, mr);
+    auto immediate_indices = cudf::conditional_full_join(left, right, left_zero_eq_right_zero);
+    this->_compare_to_hash_join(retained_indices, immediate_indices);
+  }
+  {
+    auto [left_wrappers, right_wrappers, left_columns, right_columns, left, right] =
+      this->parse_input(ColumnVector<TypeParam>{{3, 4, 5}}, ColumnVector<TypeParam>{{}});
+
+    auto retained =
+      cudf::conditional_full_join_size(left, right, left_zero_eq_right_zero, stream, mr);
+    EXPECT_EQ(retained->output_size(), 3);
+
+    auto retained_indices  = retained->materialize_indices(stream, mr);
+    auto immediate_indices = cudf::conditional_full_join(left, right, left_zero_eq_right_zero);
+    this->_compare_to_hash_join(retained_indices, immediate_indices);
+  }
+}
+
+TYPED_TEST(ConditionalFullJoinTest, RetainedSizeDataRejectsNonBoolPredicateForEmptyInputs)
+{
+  auto [left_wrappers, right_wrappers, left_columns, right_columns, left, right] =
+    this->parse_input(ColumnVector<TypeParam>{{}}, ColumnVector<TypeParam>{{3, 4, 5}});
+  auto non_bool_predicate = cudf::ast::column_reference(0, cudf::ast::table_reference::LEFT);
+
+  EXPECT_THROW(cudf::conditional_full_join_size(left,
+                                                right,
+                                                non_bool_predicate,
+                                                cudf::get_default_stream(),
+                                                cudf::get_current_device_resource_ref()),
+               cudf::data_type_error);
+}
+
+TYPED_TEST(ConditionalFullJoinTest, RetainedSizeDataRequiresOriginalStream)
+{
+  auto [left_wrappers, right_wrappers, left_columns, right_columns, left, right] =
+    this->parse_input(ColumnVector<TypeParam>{{0, 1, 2}}, ColumnVector<TypeParam>{{0, 1, 3}});
+  auto const mr = cudf::get_current_device_resource_ref();
+  rmm::cuda_stream sizing_stream{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream materialize_stream{rmm::cuda_stream::flags::non_blocking};
+
+  auto retained =
+    cudf::conditional_full_join_size(left, right, left_zero_eq_right_zero, sizing_stream, mr);
+
+  EXPECT_THROW(
+    {
+      auto ignored = retained->materialize_indices(materialize_stream, mr);
+      static_cast<void>(ignored);
+    },
+    cudf::logic_error);
+  auto retained_indices = retained->materialize_indices(sizing_stream, mr);
+  EXPECT_EQ(retained_indices.first->size(), retained->output_size());
+  EXPECT_EQ(retained_indices.second->size(), retained->output_size());
+  sizing_stream.synchronize();
+}
+
+TYPED_TEST(ConditionalFullJoinTest, RetainedSizeDataUsesExplicitMemoryResource)
+{
+  auto const stream       = cudf::get_default_stream();
+  auto expect_explicit_mr = [&](char const* name,
+                                cudf::table_view const& left,
+                                cudf::table_view const& right) {
+    auto ambient_mr = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+    auto supplied_mr =
+      rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+    auto const supplied_ref = rmm::device_async_resource_ref{supplied_mr};
+    {
+      cudf::test::scoped_current_device_resource current_scope{ambient_mr};
+      auto retained = cudf::conditional_full_join_size(
+        left, right, left_zero_eq_right_zero, stream, supplied_ref);
+      EXPECT_EQ(ambient_mr.get_bytes_counter().total, 0) << name;
+      EXPECT_GT(supplied_mr.get_bytes_counter().total, 0) << name;
+
+      auto indices = retained->materialize_indices(stream, supplied_ref);
+      stream.synchronize();
+      EXPECT_EQ(ambient_mr.get_bytes_counter().total, 0) << name;
+      EXPECT_EQ(indices.first->size(), retained->output_size()) << name;
+      EXPECT_EQ(indices.second->size(), retained->output_size()) << name;
+    }
+    stream.synchronize();
+    EXPECT_EQ(ambient_mr.get_bytes_counter().value, 0) << name;
+    EXPECT_EQ(supplied_mr.get_bytes_counter().value, 0) << name;
+  };
+
+  {
+    auto [left_wrappers, right_wrappers, left_columns, right_columns, left, right] =
+      this->parse_input(ColumnVector<TypeParam>{{0, 1, 2}}, ColumnVector<TypeParam>{{0, 1, 3}});
+    expect_explicit_mr("non-empty", left, right);
+  }
+  {
+    auto [left_wrappers, right_wrappers, left_columns, right_columns, left, right] =
+      this->parse_input(ColumnVector<TypeParam>{{3, 4, 5}}, ColumnVector<TypeParam>{{}});
+    expect_explicit_mr("empty right", left, right);
+  }
+}
+
+TYPED_TEST(ConditionalFullJoinTest, RetainedSizeDataReleasesAllocationsWhenSetupFails)
+{
+  auto [left_wrappers, right_wrappers, left_columns, right_columns, left, right] =
+    this->parse_input(ColumnVector<TypeParam>{{0, 1, 2}}, ColumnVector<TypeParam>{{0, 1, 3}});
+  auto non_bool_predicate = cudf::ast::column_reference(0, cudf::ast::table_reference::LEFT);
+  auto const stream       = cudf::get_default_stream();
+  auto supplied_mr = rmm::mr::statistics_resource_adaptor{cudf::get_current_device_resource_ref()};
+
+  EXPECT_THROW(
+    cudf::conditional_full_join_size(
+      left, right, non_bool_predicate, stream, rmm::device_async_resource_ref{supplied_mr}),
+    cudf::data_type_error);
+  stream.synchronize();
+  EXPECT_EQ(supplied_mr.get_bytes_counter().value, 0);
+}
+
+TYPED_TEST(ConditionalFullJoinTest, RetainedSizeDataBorrowsInputsUntilMaterialization)
+{
+  auto [left_wrappers, right_wrappers, left_columns, right_columns, left, right] =
+    this->parse_input(ColumnVector<TypeParam>{{0, 1, 2}}, ColumnVector<TypeParam>{{0, 1, 3}});
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  auto retained =
+    cudf::conditional_full_join_size(left, right, left_zero_eq_right_zero, stream, mr);
+  EXPECT_EQ(retained->output_size(), 4);
+
+  // The retained state borrows the input buffers and re-evaluates the predicate
+  // during materialization; mutating an input between sizing and
+  // materialization is outside the documented contract. The mutation below is
+  // observed in the materialized pairs, proving no hidden snapshot exists. It
+  // strictly removes one match so every left row still fits its retained slice.
+  auto const mutated                     = static_cast<TypeParam>(9);
+  cudf::mutable_column_view mutable_left = left_wrappers[0];
+  CUDF_CUDA_TRY(cudaMemcpyAsync(mutable_left.data<TypeParam>(),
+                                &mutated,
+                                sizeof(TypeParam),
+                                cudaMemcpyHostToDevice,
+                                stream.value()));
+  stream.synchronize();
+
+  auto indices = retained->materialize_indices(stream, mr);
+  EXPECT_EQ(indices.first->size(), retained->output_size());
+  EXPECT_EQ(indices.second->size(), retained->output_size());
+  auto lhs_result = cudf::detail::make_std_vector(*indices.first, stream);
+  auto rhs_result = cudf::detail::make_std_vector(*indices.second, stream);
+  std::vector<std::pair<cudf::size_type, cudf::size_type>> result_pairs(lhs_result.size());
+  std::transform(lhs_result.begin(),
+                 lhs_result.end(),
+                 rhs_result.begin(),
+                 result_pairs.begin(),
+                 [](cudf::size_type lhs, cudf::size_type rhs) { return std::pair{lhs, rhs}; });
+  std::sort(result_pairs.begin(), result_pairs.end());
+  auto const no_match = static_cast<cudf::size_type>(cudf::JoinNoMatch);
+  std::vector<std::pair<cudf::size_type, cudf::size_type>> const expected{
+    {no_match, 2}, {0, no_match}, {1, 1}, {2, no_match}};
+  EXPECT_EQ(result_pairs, expected);
+}
 
 TYPED_TEST(ConditionalFullJoinTest, TestCompareRandomToHash)
 {

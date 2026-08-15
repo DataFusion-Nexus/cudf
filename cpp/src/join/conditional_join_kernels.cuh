@@ -210,6 +210,104 @@ CUDF_KERNEL void compute_conditional_join_output_size(
 }
 
 /**
+ * @brief Computes retained size data for a conditional full join.
+ *
+ * The `matches_per_left_row` output contains the number of rows emitted by the
+ * left-outer phase for each left row: matching pair count, or one row for an
+ * unmatched left row. The `right_row_has_match` output is set to one for each
+ * right row that matched at least one left row.
+ */
+template <int block_size, bool has_nulls>
+CUDF_KERNEL void compute_conditional_full_join_size_data(
+  table_device_view left_table,
+  table_device_view right_table,
+  ast::detail::expression_device_view device_expression_data,
+  cudf::size_type* matches_per_left_row,
+  cudf::size_type* right_row_has_match)
+{
+  extern __shared__ char raw_intermediate_storage[];
+  cudf::ast::detail::IntermediateDataType<has_nulls>* intermediate_storage =
+    reinterpret_cast<cudf::ast::detail::IntermediateDataType<has_nulls>*>(raw_intermediate_storage);
+  auto thread_intermediate_storage =
+    &intermediate_storage[threadIdx.x * device_expression_data.num_intermediates];
+
+  auto const start_idx = cudf::detail::grid_1d::global_thread_id<block_size>();
+  auto const stride    = cudf::detail::grid_1d::grid_stride<block_size>();
+
+  cudf::thread_index_type const left_num_rows  = left_table.num_rows();
+  cudf::thread_index_type const right_num_rows = right_table.num_rows();
+
+  auto evaluator = cudf::ast::detail::expression_evaluator<has_nulls>(
+    left_table, right_table, device_expression_data);
+
+  for (cudf::thread_index_type left_row_index = start_idx; left_row_index < left_num_rows;
+       left_row_index += stride) {
+    cudf::size_type row_match_count = 0;
+    for (cudf::thread_index_type right_row_index = 0; right_row_index < right_num_rows;
+         ++right_row_index) {
+      auto output_dest = cudf::ast::detail::value_expression_result<bool, has_nulls>();
+      evaluator.evaluate(
+        output_dest, left_row_index, right_row_index, 0, thread_intermediate_storage);
+      if (output_dest.is_valid() && output_dest.value()) {
+        ++row_match_count;
+        atomicExch(right_row_has_match + right_row_index, 1);
+      }
+    }
+    matches_per_left_row[left_row_index] = row_match_count == 0 ? 1 : row_match_count;
+  }
+}
+
+/**
+ * @brief Materializes the left-outer phase of a conditional full join from retained size data.
+ */
+template <int block_size, bool has_nulls>
+CUDF_KERNEL void conditional_left_join_from_size_data(
+  table_device_view left_table,
+  table_device_view right_table,
+  ast::detail::expression_device_view device_expression_data,
+  cudf::size_type const* join_result_offsets,
+  cudf::size_type* join_output_l,
+  cudf::size_type* join_output_r)
+{
+  extern __shared__ char raw_intermediate_storage[];
+  cudf::ast::detail::IntermediateDataType<has_nulls>* intermediate_storage =
+    reinterpret_cast<cudf::ast::detail::IntermediateDataType<has_nulls>*>(raw_intermediate_storage);
+  auto thread_intermediate_storage =
+    &intermediate_storage[threadIdx.x * device_expression_data.num_intermediates];
+
+  auto const start_idx = cudf::detail::grid_1d::global_thread_id<block_size>();
+  auto const stride    = cudf::detail::grid_1d::grid_stride<block_size>();
+
+  cudf::thread_index_type const left_num_rows  = left_table.num_rows();
+  cudf::thread_index_type const right_num_rows = right_table.num_rows();
+
+  auto evaluator = cudf::ast::detail::expression_evaluator<has_nulls>(
+    left_table, right_table, device_expression_data);
+
+  for (cudf::thread_index_type left_row_index = start_idx; left_row_index < left_num_rows;
+       left_row_index += stride) {
+    auto output_offset              = join_result_offsets[left_row_index];
+    cudf::size_type emitted_matches = 0;
+    for (cudf::thread_index_type right_row_index = 0; right_row_index < right_num_rows;
+         ++right_row_index) {
+      auto output_dest = cudf::ast::detail::value_expression_result<bool, has_nulls>();
+      evaluator.evaluate(
+        output_dest, left_row_index, right_row_index, 0, thread_intermediate_storage);
+      if (output_dest.is_valid() && output_dest.value()) {
+        auto const output_index     = output_offset + emitted_matches;
+        join_output_l[output_index] = left_row_index;
+        join_output_r[output_index] = right_row_index;
+        ++emitted_matches;
+      }
+    }
+    if (emitted_matches == 0) {
+      join_output_l[output_offset] = left_row_index;
+      join_output_r[output_offset] = static_cast<cudf::size_type>(cudf::JoinNoMatch);
+    }
+  }
+}
+
+/**
  * @brief Performs a join conditioned on a predicate to find all matching rows
  * between the left and right tables and generate the output for the desired
  * Join operation.
