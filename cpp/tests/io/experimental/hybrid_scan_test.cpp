@@ -21,6 +21,7 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
@@ -28,8 +29,191 @@
 #include <rmm/mr/aligned_resource_adaptor.hpp>
 
 #include <cuda/iterator>
+#include <cuda_runtime_api.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <future>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
 
 namespace {
+
+class scoped_env_var {
+ public:
+  scoped_env_var(std::string name, std::string value) : name_(std::move(name))
+  {
+    if (auto const* previous = std::getenv(name_.c_str()); previous != nullptr) {
+      previous_value_ = previous;
+    }
+    setenv(name_.c_str(), value.c_str(), 1);
+  }
+
+  scoped_env_var(scoped_env_var const&)            = delete;
+  scoped_env_var& operator=(scoped_env_var const&) = delete;
+
+  ~scoped_env_var()
+  {
+    if (previous_value_.has_value()) {
+      setenv(name_.c_str(), previous_value_->c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
+  std::optional<std::string> previous_value_;
+};
+
+class recording_datasource final : public cudf::io::datasource {
+ public:
+  struct request {
+    std::size_t offset;
+    std::size_t size;
+
+    friend bool operator==(request const&, request const&) = default;
+  };
+
+  recording_datasource(std::vector<uint8_t> data, bool device_read)
+    : data_(std::move(data)), device_read_(device_read)
+  {
+  }
+
+  std::unique_ptr<buffer> host_read(std::size_t offset, std::size_t size) override
+  {
+    record(offset, size);
+    validate(offset, size);
+    std::vector<uint8_t> result(size);
+    std::memcpy(result.data(), data_.data() + offset, size);
+    return buffer::create(std::move(result));
+  }
+
+  std::size_t host_read(std::size_t offset, std::size_t size, uint8_t* dst) override
+  {
+    record(offset, size);
+    validate(offset, size);
+    std::memcpy(dst, data_.data() + offset, size);
+    return size;
+  }
+
+  [[nodiscard]] bool supports_device_read() const override { return device_read_; }
+
+  [[nodiscard]] bool is_device_read_preferred(std::size_t) const override { return device_read_; }
+
+  std::future<std::size_t> device_read_async(std::size_t offset,
+                                             std::size_t size,
+                                             uint8_t* dst,
+                                             rmm::cuda_stream_view stream) override
+  {
+    record(offset, size);
+    validate(offset, size);
+    return std::async(std::launch::deferred, [this, offset, size, dst, stream] {
+      CUDF_CUDA_TRY(
+        cudaMemcpyAsync(dst, data_.data() + offset, size, cudaMemcpyHostToDevice, stream.value()));
+      CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+      return size;
+    });
+  }
+
+  [[nodiscard]] std::size_t size() const override { return data_.size(); }
+
+  [[nodiscard]] std::vector<request> requests() const
+  {
+    std::scoped_lock lock(mutex_);
+    return requests_;
+  }
+
+ private:
+  void validate(std::size_t offset, std::size_t size) const
+  {
+    CUDF_EXPECTS(offset <= data_.size() && size <= data_.size() - offset,
+                 "recording datasource range is outside its data");
+  }
+
+  void record(std::size_t offset, std::size_t size)
+  {
+    std::scoped_lock lock(mutex_);
+    requests_.push_back({offset, size});
+  }
+
+  std::vector<uint8_t> data_;
+  bool device_read_;
+  mutable std::mutex mutex_;
+  std::vector<request> requests_;
+};
+
+std::vector<uint8_t> make_recording_data(std::size_t size)
+{
+  std::vector<uint8_t> data(size);
+  std::transform(data.begin(), data.end(), data.begin(), [value = std::size_t{0}](uint8_t) mutable {
+    return static_cast<uint8_t>(value++ % 251);
+  });
+  return data;
+}
+
+std::vector<uint8_t> copy_device_span(cudf::device_span<uint8_t const> span)
+{
+  std::vector<uint8_t> result(span.size());
+  if (not result.empty()) {
+    CUDF_CUDA_TRY(cudaMemcpy(result.data(), span.data(), result.size(), cudaMemcpyDeviceToHost));
+  }
+  return result;
+}
+
+std::vector<uint8_t> expected_range_bytes(std::vector<uint8_t> const& data,
+                                          cudf::io::text::byte_range_info const range)
+{
+  auto const offset = static_cast<std::size_t>(range.offset());
+  auto const size   = static_cast<std::size_t>(range.size());
+  return {data.begin() + offset, data.begin() + offset + size};
+}
+
+std::vector<recording_datasource::request> sorted_requests(recording_datasource const& source)
+{
+  auto requests = source.requests();
+  std::sort(requests.begin(), requests.end(), [](auto const& lhs, auto const& rhs) {
+    return std::tie(lhs.offset, lhs.size) < std::tie(rhs.offset, rhs.size);
+  });
+  return requests;
+}
+
+void expect_single_source_coalescing(bool device_read)
+{
+  scoped_env_var const gap{"LIBCUDF_PARQUET_REMOTE_COALESCE_GAP_BYTES", "4"};
+  auto const data = make_recording_data(256);
+  recording_datasource source{data, device_read};
+  std::vector<std::reference_wrapper<cudf::io::datasource>> datasource_refs{std::ref(source)};
+  std::vector<std::vector<cudf::io::text::byte_range_info>> ranges_per_source{
+    {{40, 4}, {0, 4}, {20, 4}, {4, 4}, {8, 4}, {256, 0}}};
+
+  auto const stream            = cudf::get_default_stream();
+  auto const mr                = cudf::get_current_device_resource_ref();
+  auto [buffers, spans, tasks] = cudf::io::parquet::fetch_byte_ranges_to_device_async(
+    cudf::host_span<std::reference_wrapper<cudf::io::datasource> const>{datasource_refs},
+    cudf::host_span<std::vector<cudf::io::text::byte_range_info> const>{ranges_per_source},
+    stream,
+    mr);
+  tasks.get();
+
+  EXPECT_EQ(buffers.size(), 1);
+  EXPECT_EQ(spans.size(), 1);
+  ASSERT_EQ(spans.front().size(), ranges_per_source.front().size());
+  EXPECT_EQ(sorted_requests(source),
+            (std::vector<recording_datasource::request>{{0, 12}, {20, 4}, {40, 4}}));
+  for (std::size_t index = 0; index < spans.front().size(); ++index) {
+    EXPECT_EQ(copy_device_span(spans.front()[index]),
+              expected_range_bytes(data, ranges_per_source.front()[index]));
+  }
+}
 
 /**
  * @brief Helper to test the hybrid scan reader
@@ -239,6 +423,87 @@ std::unique_ptr<cudf::table> test_hybrid_scan_column_selection(
 
 // Base test fixture for tests
 struct HybridScanTest : public cudf::test::BaseFixture {};
+
+TEST_F(HybridScanTest, FetchByteRangesCoalescesPhysicalOrderForHostReads)
+{
+  expect_single_source_coalescing(false);
+}
+
+TEST_F(HybridScanTest, FetchByteRangesCoalescesPhysicalOrderForDeviceReads)
+{
+  expect_single_source_coalescing(true);
+}
+
+TEST_F(HybridScanTest, FetchByteRangesKeepsSourcePartitionsAndStrictGapFallback)
+{
+  auto const invalid_gap_values = std::vector<std::string>{
+    "", "-1", "+1", "4suffix", std::to_string(std::numeric_limits<std::size_t>::max()) + "0"};
+
+  for (auto const& invalid_gap : invalid_gap_values) {
+    scoped_env_var const gap{"LIBCUDF_PARQUET_REMOTE_COALESCE_GAP_BYTES", invalid_gap};
+    auto const source_zero_data = make_recording_data(65'545);
+    auto const source_one_data  = make_recording_data(32);
+    recording_datasource source_zero{source_zero_data, false};
+    recording_datasource source_one{source_one_data, false};
+    std::vector<std::reference_wrapper<cudf::io::datasource>> datasource_refs{std::ref(source_zero),
+                                                                              std::ref(source_one)};
+    std::vector<std::vector<cudf::io::text::byte_range_info>> ranges_per_source{
+      {{65'541, 4}, {0, 4}}, {{8, 4}, {0, 4}}};
+
+    auto const stream            = cudf::get_default_stream();
+    auto const mr                = cudf::get_current_device_resource_ref();
+    auto [buffers, spans, tasks] = cudf::io::parquet::fetch_byte_ranges_to_device_async(
+      cudf::host_span<std::reference_wrapper<cudf::io::datasource> const>{datasource_refs},
+      cudf::host_span<std::vector<cudf::io::text::byte_range_info> const>{ranges_per_source},
+      stream,
+      mr);
+    tasks.get();
+
+    EXPECT_EQ(buffers.size(), 2);
+    ASSERT_EQ(spans.size(), 2);
+    ASSERT_EQ(spans[0].size(), ranges_per_source[0].size());
+    ASSERT_EQ(spans[1].size(), ranges_per_source[1].size());
+    EXPECT_EQ(sorted_requests(source_zero),
+              (std::vector<recording_datasource::request>{{0, 4}, {65'541, 4}}));
+    EXPECT_EQ(sorted_requests(source_one), (std::vector<recording_datasource::request>{{0, 12}}));
+    for (std::size_t index = 0; index < spans[0].size(); ++index) {
+      EXPECT_EQ(copy_device_span(spans[0][index]),
+                expected_range_bytes(source_zero_data, ranges_per_source[0][index]));
+    }
+    for (std::size_t index = 0; index < spans[1].size(); ++index) {
+      EXPECT_EQ(copy_device_span(spans[1][index]),
+                expected_range_bytes(source_one_data, ranges_per_source[1][index]));
+    }
+  }
+}
+
+TEST_F(HybridScanTest, FetchByteRangesSortsOverlappingRangesWithoutUnderflow)
+{
+  scoped_env_var const gap{"LIBCUDF_PARQUET_REMOTE_COALESCE_GAP_BYTES", "0"};
+  auto const data = make_recording_data(32);
+  recording_datasource source{data, true};
+  std::vector<std::reference_wrapper<cudf::io::datasource>> datasource_refs{std::ref(source)};
+  std::vector<std::vector<cudf::io::text::byte_range_info>> ranges_per_source{
+    {{4, 4}, {0, 8}, {16, 2}}};
+
+  auto const stream            = cudf::get_default_stream();
+  auto const mr                = cudf::get_current_device_resource_ref();
+  auto [buffers, spans, tasks] = cudf::io::parquet::fetch_byte_ranges_to_device_async(
+    cudf::host_span<std::reference_wrapper<cudf::io::datasource> const>{datasource_refs},
+    cudf::host_span<std::vector<cudf::io::text::byte_range_info> const>{ranges_per_source},
+    stream,
+    mr);
+  tasks.get();
+
+  EXPECT_EQ(source.requests(),
+            (std::vector<recording_datasource::request>{{0, 8}, {4, 4}, {16, 2}}));
+  ASSERT_EQ(spans.size(), 1);
+  ASSERT_EQ(spans.front().size(), ranges_per_source.front().size());
+  for (std::size_t index = 0; index < spans.front().size(); ++index) {
+    EXPECT_EQ(copy_device_span(spans.front()[index]),
+              expected_range_bytes(data, ranges_per_source.front()[index]));
+  }
+}
 
 TEST_F(HybridScanTest, FilterRowGroupsOnlyAndScanSelectColumns)
 {

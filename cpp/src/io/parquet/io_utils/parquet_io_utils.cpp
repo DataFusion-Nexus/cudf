@@ -21,18 +21,22 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/iterator>
-#include <cuda/std/tuple>
 
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -184,6 +188,34 @@ std::vector<std::unique_ptr<cudf::io::datasource::buffer>> fetch_page_indexes_to
 
 using device_spans_per_source_type = std::vector<cudf::device_span<uint8_t const>>;
 
+struct coalesced_range {
+  std::size_t source_idx;
+  std::size_t offset;
+  std::size_t size;
+  std::size_t buffer_offset;
+  std::size_t ordered_range_begin;
+  std::size_t ordered_range_end;
+};
+
+std::size_t parquet_remote_coalesce_gap_bytes()
+{
+  constexpr auto default_gap = std::size_t{64} * 1024;
+  auto const* raw            = std::getenv("LIBCUDF_PARQUET_REMOTE_COALESCE_GAP_BYTES");
+  if (raw == nullptr) { return default_gap; }
+
+  std::string_view const text{raw};
+  if (text.empty() || std::any_of(text.begin(), text.end(), [](char const value) {
+        return value < '0' || value > '9';
+      })) {
+    return default_gap;
+  }
+
+  std::size_t parsed{};
+  auto const result = std::from_chars(text.data(), text.data() + text.size(), parsed, 10);
+  if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) { return default_gap; }
+  return parsed;
+}
+
 std::tuple<std::vector<rmm::device_buffer>,
            std::vector<device_spans_per_source_type>,
            std::future<void>>
@@ -209,118 +241,151 @@ fetch_byte_ranges_to_device_async_impl(
                     std::size_t{0},
                     [](auto acc, auto const& ranges) { return acc + ranges.size(); });
 
-  // IO descriptors
-  std::vector<size_t> io_source_indices;
-  std::vector<size_t> io_offsets;
-  std::vector<size_t> io_sizes;
-  std::vector<uint8_t*> destinations;
-  io_source_indices.reserve(total_byte_ranges);
-  io_offsets.reserve(total_byte_ranges);
-  io_sizes.reserve(total_byte_ranges);
-  destinations.reserve(total_byte_ranges);
+  auto checked_add = [](std::size_t left, std::size_t right, char const* message) {
+    CUDF_EXPECTS(
+      left <= std::numeric_limits<std::size_t>::max() - right, message, std::overflow_error);
+    return left + right;
+  };
 
-  // Allocate one device buffer per byte ranges of a datasource
+  using normalized_range = std::pair<std::size_t, std::size_t>;
+  std::vector<std::vector<normalized_range>> normalized_ranges(num_sources);
+  std::vector<std::vector<std::size_t>> range_buffer_offsets(num_sources);
+  std::vector<std::size_t> physical_range_order;
+  std::vector<coalesced_range> read_schedule;
+  std::vector<std::size_t> source_buffer_sizes(num_sources, 0);
+  physical_range_order.reserve(total_byte_ranges);
+  read_schedule.reserve(total_byte_ranges);
+
+  auto const coalesce_gap_bytes = parquet_remote_coalesce_gap_bytes();
+  for (std::size_t source_idx = 0; source_idx < num_sources; ++source_idx) {
+    auto const& byte_ranges = byte_ranges_per_source[source_idx];
+    auto& ranges            = normalized_ranges[source_idx];
+    auto& buffer_offsets    = range_buffer_offsets[source_idx];
+    ranges.reserve(byte_ranges.size());
+    buffer_offsets.resize(byte_ranges.size());
+
+    for (auto const& range : byte_ranges) {
+      CUDF_EXPECTS(range.offset() >= 0, "Parquet byte range offset must be non-negative");
+      CUDF_EXPECTS(range.size() >= 0, "Parquet byte range size must be non-negative");
+      auto const offset = static_cast<std::size_t>(range.offset());
+      auto const size   = static_cast<std::size_t>(range.size());
+      checked_add(offset, size, "Parquet byte range endpoint overflowed size_t");
+      ranges.emplace_back(offset, size);
+    }
+
+    auto const ordered_begin = physical_range_order.size();
+    for (std::size_t range_idx = 0; range_idx < ranges.size(); ++range_idx) {
+      if (ranges[range_idx].second != 0) { physical_range_order.emplace_back(range_idx); }
+    }
+    auto const ordered_end = physical_range_order.size();
+    std::stable_sort(
+      physical_range_order.begin() + ordered_begin,
+      physical_range_order.begin() + ordered_end,
+      [&](std::size_t lhs, std::size_t rhs) { return ranges[lhs].first < ranges[rhs].first; });
+
+    for (std::size_t order_idx = ordered_begin; order_idx < ordered_end;) {
+      auto const first_range_idx = physical_range_order[order_idx];
+      auto const group_offset    = ranges[first_range_idx].first;
+      auto group_end             = checked_add(group_offset,
+                                   ranges[first_range_idx].second,
+                                   "Parquet coalesced range endpoint overflowed size_t");
+      auto next_order_idx        = order_idx + 1;
+
+      while (next_order_idx < ordered_end) {
+        auto const next_range_idx = physical_range_order[next_order_idx];
+        auto const next_offset    = ranges[next_range_idx].first;
+        if (next_offset < group_end || next_offset - group_end > coalesce_gap_bytes) { break; }
+        group_end = checked_add(next_offset,
+                                ranges[next_range_idx].second,
+                                "Parquet coalesced range endpoint overflowed size_t");
+        ++next_order_idx;
+      }
+
+      auto const group_size    = group_end - group_offset;
+      auto const buffer_offset = source_buffer_sizes[source_idx];
+      source_buffer_sizes[source_idx] =
+        checked_add(buffer_offset, group_size, "Parquet source buffer size overflowed size_t");
+      read_schedule.push_back(
+        {source_idx, group_offset, group_size, buffer_offset, order_idx, next_order_idx});
+      order_idx = next_order_idx;
+    }
+  }
+
+  for (auto const& range : read_schedule) {
+    auto const& ranges   = normalized_ranges[range.source_idx];
+    auto& buffer_offsets = range_buffer_offsets[range.source_idx];
+    for (auto order_idx = range.ordered_range_begin; order_idx < range.ordered_range_end;
+         ++order_idx) {
+      auto const range_idx   = physical_range_order[order_idx];
+      auto const range_delta = ranges[range_idx].first - range.offset;
+      buffer_offsets[range_idx] =
+        checked_add(range.buffer_offset,
+                    range_delta,
+                    "Parquet coalesced range buffer offset overflowed size_t");
+    }
+  }
+
   std::vector<rmm::device_buffer> column_chunk_buffers{};
   column_chunk_buffers.reserve(num_sources);
+  for (auto const buffer_size : source_buffer_sizes) {
+    column_chunk_buffers.emplace_back(
+      cudf::util::round_up_safe(buffer_size, cudf::io::detail::BUFFER_PADDING_MULTIPLE),
+      stream,
+      mr);
+  }
 
-  // Column chunk device spans, one per byte range per datasource
   std::vector<device_spans_per_source_type> column_chunk_data_per_source(num_sources);
-
-  std::for_each(
-    cuda::counting_iterator<cudf::size_type>(0),
-    cuda::counting_iterator<cudf::size_type>(num_sources),
-    [&](auto const source_idx) {
-      auto const& byte_ranges = byte_ranges_per_source[source_idx];
-
-      // Total buffer size required for column chunks of this source
-      auto const buffer_size = std::accumulate(
-        byte_ranges.begin(), byte_ranges.end(), std::size_t{0}, [](auto acc, auto const& range) {
-          return acc + range.size();
-        });
-
-      // Buffer needs to be padded. Required by `gpuDecodePageData`.
-      column_chunk_buffers.emplace_back(
-        cudf::util::round_up_safe(buffer_size, cudf::io::detail::BUFFER_PADDING_MULTIPLE),
-        stream,
-        mr);
-
-      auto buffer_data = static_cast<uint8_t*>(column_chunk_buffers.back().data());
-
-      // Build device spans for each byte range in this source
-      auto& column_chunk_data = column_chunk_data_per_source[source_idx];
-      column_chunk_data.reserve(byte_ranges.size());
-      std::ignore = std::accumulate(
-        byte_ranges.begin(), byte_ranges.end(), std::size_t{0}, [&](auto acc, auto const& range) {
-          column_chunk_data.emplace_back(buffer_data + acc, static_cast<size_t>(range.size()));
-          return acc + range.size();
-        });
-
-      // Coalesce contiguous byte ranges within this source into single IO request
-      for (size_t chunk = 0; chunk < byte_ranges.size();) {
-        auto const io_offset = static_cast<size_t>(byte_ranges[chunk].offset());
-        auto io_size         = static_cast<size_t>(byte_ranges[chunk].size());
-        size_t next_chunk    = chunk + 1;
-        while (next_chunk < byte_ranges.size()) {
-          size_t const next_offset = byte_ranges[next_chunk].offset();
-          if (next_offset != io_offset + io_size) { break; }
-          io_size += byte_ranges[next_chunk].size();
-          next_chunk++;
-        }
-        if (io_size != 0) {
-          io_source_indices.push_back(source_idx);
-          io_offsets.push_back(io_offset);
-          io_sizes.push_back(io_size);
-          destinations.push_back(const_cast<uint8_t*>(column_chunk_data[chunk].data()));
-        }
-        chunk = next_chunk;
-      }
-    });
-
-  CUDF_EXPECTS(io_offsets.size() == io_sizes.size() and io_sizes.size() == destinations.size() and
-                 io_source_indices.size() == io_offsets.size(),
-               "Unexpected number of IO source indices, offsets, sizes, or destinations");
+  for (std::size_t source_idx = 0; source_idx < num_sources; ++source_idx) {
+    auto const& ranges         = normalized_ranges[source_idx];
+    auto const& buffer_offsets = range_buffer_offsets[source_idx];
+    auto& column_chunk_data    = column_chunk_data_per_source[source_idx];
+    column_chunk_data.reserve(ranges.size());
+    auto* const buffer_data = static_cast<uint8_t*>(column_chunk_buffers[source_idx].data());
+    for (std::size_t range_idx = 0; range_idx < ranges.size(); ++range_idx) {
+      auto const size        = ranges[range_idx].second;
+      auto const* range_data = size == 0 ? buffer_data : buffer_data + buffer_offsets[range_idx];
+      column_chunk_data.emplace_back(range_data, size);
+    }
+  }
 
   using host_read_buffer = std::unique_ptr<cudf::io::datasource::buffer>;
 
   // Vectors to hold futures from datasource
   std::vector<std::future<size_t>> device_read_tasks{};
   std::vector<std::future<host_read_buffer>> host_read_tasks{};
-  device_read_tasks.reserve(io_offsets.size());
-  host_read_tasks.reserve(io_offsets.size());
+  device_read_tasks.reserve(read_schedule.size());
+  host_read_tasks.reserve(read_schedule.size());
 
   // Vectors to store intermediate host buffers and relevant pointers
   std::vector<host_read_buffer> host_buffers{};
   std::vector<void const*> copy_srcs{};
   std::vector<void*> copy_dsts{};
   std::vector<size_t> copy_sizes{};
-  copy_dsts.reserve(io_offsets.size());
-  copy_sizes.reserve(io_offsets.size());
+  copy_dsts.reserve(read_schedule.size());
+  copy_sizes.reserve(read_schedule.size());
 
-  auto iter = cuda::make_zip_iterator(
-    io_source_indices.begin(), io_offsets.begin(), io_sizes.begin(), destinations.begin());
+  auto destination_for = [&](coalesced_range const& range) {
+    return static_cast<uint8_t*>(column_chunk_buffers[range.source_idx].data()) +
+           range.buffer_offset;
+  };
 
   // Schedule host reads holding the `host_read_mutex` so that all reads for a caller thread
   // are scheduled without interleaving with reads from other threads yielding better pipelining
   {
     std::scoped_lock<std::mutex> lock(host_read_mutex);
 
-    std::for_each(iter, iter + io_offsets.size(), [&](auto const& tuple) {
-      auto const src_idx   = cuda::std::get<0>(tuple);
-      auto const io_offset = cuda::std::get<1>(tuple);
-      auto const io_size   = cuda::std::get<2>(tuple);
-      auto const dest      = cuda::std::get<3>(tuple);
-
-      auto& datasource = datasources[src_idx].get();
-      if (not datasource.is_device_read_preferred(io_size)) {
+    for (auto const& range : read_schedule) {
+      auto& datasource = datasources[range.source_idx].get();
+      if (not datasource.is_device_read_preferred(range.size)) {
         // Asynchronously read column chunk data to a host buffer
         host_read_tasks.emplace_back(cudf::detail::host_worker_pool().submit_task(
-          [&datasource, io_offset, io_size]() -> host_read_buffer {
-            return datasource.host_read(io_offset, io_size);
+          [&datasource, offset = range.offset, size = range.size]() -> host_read_buffer {
+            return datasource.host_read(offset, size);
           }));
-        copy_dsts.push_back(static_cast<void*>(dest));
-        copy_sizes.push_back(io_size);
+        copy_dsts.push_back(static_cast<void*>(destination_for(range)));
+        copy_sizes.push_back(range.size);
       }
-    });
+    }
   }
 
   // Complete host reads
@@ -342,19 +407,14 @@ fetch_byte_ranges_to_device_async_impl(
   {
     std::scoped_lock<std::mutex> lock(device_read_mutex);
 
-    std::for_each(iter, iter + io_offsets.size(), [&](auto const& tuple) {
-      auto const src_idx   = cuda::std::get<0>(tuple);
-      auto const io_offset = cuda::std::get<1>(tuple);
-      auto const io_size   = cuda::std::get<2>(tuple);
-      auto const dest      = cuda::std::get<3>(tuple);
-
-      auto& datasource = datasources[src_idx].get();
+    for (auto const& range : read_schedule) {
+      auto& datasource = datasources[range.source_idx].get();
       // Directly read the column chunk data to the device buffer if supported
-      if (datasource.is_device_read_preferred(io_size)) {
+      if (datasource.is_device_read_preferred(range.size)) {
         device_read_tasks.emplace_back(
-          datasource.device_read_async(io_offset, io_size, dest, stream));
+          datasource.device_read_async(range.offset, range.size, destination_for(range), stream));
       }
-    });
+    }
 
     // Schedule a batched memcpy from host buffers to device
     if (not host_buffers.empty()) {
