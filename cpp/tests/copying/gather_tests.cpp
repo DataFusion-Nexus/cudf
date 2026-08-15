@@ -7,11 +7,13 @@
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/iterator_utilities.hpp>
+#include <cudf_test/memory_resource_utilities.hpp>
 #include <cudf_test/random.hpp>
 #include <cudf_test/table_utilities.hpp>
 #include <cudf_test/type_lists.hpp>
 
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_device_view.cuh>
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/iterator.cuh>
@@ -21,9 +23,15 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
-#include <cuda/iterator>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
+#include <cuda/iterator>
+#include <cuda_runtime_api.h>
+
+#include <cstdint>
+#include <limits>
 #include <numeric>
+#include <vector>
 
 template <typename T>
 class GatherTest : public cudf::test::BaseFixture {};
@@ -266,4 +274,260 @@ TEST_F(GatherNullableTest, NullableNoNulls)
     cudf::gather(source_table, gather_map->view(), cudf::out_of_bounds_policy::DONT_CHECK);
 
   CUDF_TEST_EXPECT_TABLES_EQUAL(source_table, result->view());
+}
+
+namespace {
+
+void expect_same_preflight(cudf::gather_fixed_width_dont_check_preflight_result const& lhs,
+                           cudf::gather_fixed_width_dont_check_preflight_result const& rhs)
+{
+  EXPECT_EQ(lhs.gather_map_bytes, rhs.gather_map_bytes);
+  EXPECT_EQ(lhs.output_data_bytes, rhs.output_data_bytes);
+  EXPECT_EQ(lhs.output_null_mask_bytes, rhs.output_null_mask_bytes);
+  EXPECT_EQ(lhs.target_mask_pointer_array_bytes, rhs.target_mask_pointer_array_bytes);
+  EXPECT_EQ(lhs.source_table_device_view_bytes, rhs.source_table_device_view_bytes);
+  EXPECT_EQ(lhs.valid_count_array_bytes, rhs.valid_count_array_bytes);
+  EXPECT_EQ(lhs.native_temporary_workspace_bytes, rhs.native_temporary_workspace_bytes);
+  EXPECT_EQ(lhs.active_phase_peak_bytes, rhs.active_phase_peak_bytes);
+}
+
+}  // namespace
+
+TEST(GatherFixedWidthPreflight, ZeroRowsKeepNullableOwnerTemporaries)
+{
+  int device;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+
+  std::vector<cudf::gather_fixed_width_column_metadata> columns{
+    {cudf::data_type{cudf::type_id::INT32}, false, 0},
+    {cudf::data_type{cudf::type_id::FLOAT32}, true, 0},
+    {cudf::data_type{cudf::type_id::INT64}, true, 0}};
+  auto const result = cudf::gather_fixed_width_dont_check_preflight(0, columns, -1);
+
+  auto const expected_pointer_bytes = columns.size() * sizeof(cudf::bitmask_type*);
+  auto const expected_view_bytes =
+    columns.size() * sizeof(cudf::column_device_view) + alignof(cudf::column_device_view) - 1;
+  auto const expected_count_bytes = columns.size() * sizeof(cudf::size_type);
+  auto const expected_temporary_bytes =
+    expected_pointer_bytes + expected_view_bytes + expected_count_bytes;
+
+  EXPECT_EQ(result.gather_map_bytes, 0);
+  EXPECT_EQ(result.output_data_bytes, 0);
+  EXPECT_EQ(result.output_null_mask_bytes, 0);
+  EXPECT_EQ(result.target_mask_pointer_array_bytes, expected_pointer_bytes);
+  EXPECT_EQ(result.source_table_device_view_bytes, expected_view_bytes);
+  EXPECT_EQ(result.valid_count_array_bytes, expected_count_bytes);
+  EXPECT_EQ(result.native_temporary_workspace_bytes, expected_temporary_bytes);
+  EXPECT_EQ(result.active_phase_peak_bytes, expected_temporary_bytes);
+
+  std::vector<cudf::gather_fixed_width_column_metadata> non_nullable{
+    {cudf::data_type{cudf::type_id::INT32}, false, 0}};
+  auto const empty_result = cudf::gather_fixed_width_dont_check_preflight(0, non_nullable, device);
+  EXPECT_EQ(empty_result.active_phase_peak_bytes, 0);
+  EXPECT_EQ(empty_result.native_temporary_workspace_bytes, 0);
+}
+
+TEST(GatherFixedWidthPreflight, SupportedTypesAndCheckedComponents)
+{
+  std::vector<cudf::gather_fixed_width_column_metadata> columns{
+    {cudf::data_type{cudf::type_id::INT8}, false, 0},
+    {cudf::data_type{cudf::type_id::INT32}, true, 0},
+    {cudf::data_type{cudf::type_id::FLOAT64}, true, 0}};
+  constexpr std::int64_t rows{7};
+  auto const result = cudf::gather_fixed_width_dont_check_preflight(rows, columns, 0);
+
+  auto const expected_map_bytes = static_cast<std::size_t>(rows) * sizeof(cudf::size_type);
+  auto const expected_data_bytes =
+    static_cast<std::size_t>(rows) * (sizeof(std::int8_t) + sizeof(std::int32_t) + sizeof(double));
+  auto const expected_mask_bytes    = 2 * cudf::bitmask_allocation_size_bytes(rows);
+  auto const expected_pointer_bytes = columns.size() * sizeof(cudf::bitmask_type*);
+  auto const expected_view_bytes =
+    columns.size() * sizeof(cudf::column_device_view) + alignof(cudf::column_device_view) - 1;
+  auto const expected_count_bytes = columns.size() * sizeof(cudf::size_type);
+  auto const expected_temporary_bytes =
+    expected_pointer_bytes + expected_view_bytes + expected_count_bytes;
+  auto const expected_peak =
+    expected_map_bytes + expected_data_bytes + expected_mask_bytes + expected_temporary_bytes;
+
+  EXPECT_EQ(result.gather_map_bytes, expected_map_bytes);
+  EXPECT_EQ(result.output_data_bytes, expected_data_bytes);
+  EXPECT_EQ(result.output_null_mask_bytes, expected_mask_bytes);
+  EXPECT_EQ(result.target_mask_pointer_array_bytes, expected_pointer_bytes);
+  EXPECT_EQ(result.source_table_device_view_bytes, expected_view_bytes);
+  EXPECT_EQ(result.valid_count_array_bytes, expected_count_bytes);
+  EXPECT_EQ(result.native_temporary_workspace_bytes, expected_temporary_bytes);
+  EXPECT_EQ(result.active_phase_peak_bytes, expected_peak);
+}
+
+TEST(GatherFixedWidthPreflight, MetadataAndTableViewOverloadsAgree)
+{
+  cudf::test::fixed_width_column_wrapper<int32_t> first{{1, 2, 3, 4}};
+  cudf::test::fixed_width_column_wrapper<float> second{{4.0F, 3.0F, 2.0F, 1.0F}, {1, 0, 1, 1}};
+  cudf::table_view source({first, second});
+  std::vector<cudf::gather_fixed_width_column_metadata> columns{
+    {cudf::data_type{cudf::type_id::INT32}, false, 0},
+    {cudf::data_type{cudf::type_id::FLOAT32}, true, 0}};
+
+  auto const metadata_result = cudf::gather_fixed_width_dont_check_preflight(3, columns, 0);
+  auto const table_result    = cudf::gather_fixed_width_dont_check_preflight(source, 3, -1);
+  expect_same_preflight(metadata_result, table_result);
+}
+
+TEST(GatherFixedWidthPreflight, MetadataQueryDoesNotAllocate)
+{
+  std::vector<cudf::gather_fixed_width_column_metadata> columns{
+    {cudf::data_type{cudf::type_id::INT32}, true, 0}};
+  auto const original = cudf::get_current_device_resource_ref();
+  auto target         = rmm::mr::statistics_resource_adaptor{original};
+
+  {
+    cudf::test::scoped_current_device_resource current_scope{
+      cuda::mr::any_resource<cuda::mr::device_accessible>{target}};
+    auto const result = cudf::gather_fixed_width_dont_check_preflight(4096, columns, -1);
+    EXPECT_GT(result.active_phase_peak_bytes, 0);
+    EXPECT_EQ(target.get_allocations_counter().total, 0);
+  }
+
+  EXPECT_TRUE(cudf::get_current_device_resource_ref() == original);
+}
+
+TEST(GatherFixedWidthPreflight, MetadataVectorAggregatesAtRowLimitDoNotAllocate)
+{
+  std::vector<cudf::gather_fixed_width_column_metadata> columns{
+    {cudf::data_type{cudf::type_id::INT8}, true, 0},
+    {cudf::data_type{cudf::type_id::INT16}, true, 0},
+    {cudf::data_type{cudf::type_id::INT32}, true, 0},
+    {cudf::data_type{cudf::type_id::INT64}, true, 0}};
+  auto const max_rows = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
+  auto const original = cudf::get_current_device_resource_ref();
+  auto target         = rmm::mr::statistics_resource_adaptor{original};
+
+  {
+    cudf::test::scoped_current_device_resource current_scope{
+      cuda::mr::any_resource<cuda::mr::device_accessible>{target}};
+    auto const result = cudf::gather_fixed_width_dont_check_preflight(
+      static_cast<std::int64_t>(max_rows), columns, -1);
+    auto const expected_mask_bytes =
+      cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(max_rows));
+    auto const expected_data_bytes    = max_rows * (sizeof(std::int8_t) + sizeof(std::int16_t) +
+                                                 sizeof(std::int32_t) + sizeof(std::int64_t));
+    auto const expected_masks         = columns.size() * expected_mask_bytes;
+    auto const expected_pointer_bytes = columns.size() * sizeof(cudf::bitmask_type*);
+    auto const expected_view_bytes =
+      columns.size() * sizeof(cudf::column_device_view) + alignof(cudf::column_device_view) - 1;
+    auto const expected_count_bytes = columns.size() * sizeof(cudf::size_type);
+    auto const expected_temporary =
+      expected_pointer_bytes + expected_view_bytes + expected_count_bytes;
+    auto const expected_peak = max_rows * sizeof(cudf::size_type) + expected_data_bytes +
+                               expected_masks + expected_temporary;
+
+    EXPECT_EQ(result.output_data_bytes, expected_data_bytes);
+    EXPECT_EQ(result.output_null_mask_bytes, expected_masks);
+    EXPECT_EQ(result.native_temporary_workspace_bytes, expected_temporary);
+    EXPECT_EQ(result.active_phase_peak_bytes, expected_peak);
+    EXPECT_EQ(target.get_allocations_counter().total, 0);
+  }
+
+  EXPECT_TRUE(cudf::get_current_device_resource_ref() == original);
+}
+
+TEST(GatherFixedWidthPreflight, RejectsUnsupportedMetadataWithoutAllocation)
+{
+  auto const original = cudf::get_current_device_resource_ref();
+  auto target         = rmm::mr::statistics_resource_adaptor{original};
+
+  {
+    cudf::test::scoped_current_device_resource current_scope{
+      cuda::mr::any_resource<cuda::mr::device_accessible>{target}};
+    std::vector<cudf::gather_fixed_width_column_metadata> columns{
+      {cudf::data_type{cudf::type_id::INT32}, false, 0}};
+    EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(-1, columns, -1), cudf::logic_error);
+    EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(
+                   std::numeric_limits<std::int64_t>::max(), columns, -1),
+                 cudf::logic_error);
+    EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(
+                   4, {{cudf::data_type{cudf::type_id::DECIMAL32, -2}, false, 0}}, -1),
+                 cudf::logic_error);
+    EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(
+                   4, {{cudf::data_type{cudf::type_id::LIST}, false, 1}}, -1),
+                 cudf::logic_error);
+    EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(
+                   4, {{cudf::data_type{cudf::type_id::STRING}, false, 0}}, -1),
+                 cudf::logic_error);
+    EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(
+                   4, {{cudf::data_type{cudf::type_id::INT32}, false, -1}}, -1),
+                 cudf::logic_error);
+    EXPECT_EQ(target.get_allocations_counter().total, 0);
+  }
+
+  EXPECT_TRUE(cudf::get_current_device_resource_ref() == original);
+}
+
+TEST(GatherFixedWidthPreflight, ZeroRowNullableOwnerPeakMatchesPreflight)
+{
+  cudf::test::fixed_width_column_wrapper<int32_t> first{{1, 2, 3, 4}, {1, 1, 0, 1}};
+  cudf::test::fixed_width_column_wrapper<int64_t> second{{4, 3, 2, 1}, {1, 0, 1, 1}};
+  cudf::test::fixed_width_column_wrapper<int32_t> gather_map;
+  cudf::table_view source({first, second});
+  auto const preflight = cudf::gather_fixed_width_dont_check_preflight(source, 0, -1);
+
+  auto const upstream = cudf::get_current_device_resource_ref();
+  auto ambient        = rmm::mr::statistics_resource_adaptor{upstream};
+  auto supplied       = rmm::mr::statistics_resource_adaptor{upstream};
+  auto const stream   = cudf::test::get_default_stream();
+
+  {
+    cudf::test::scoped_current_device_resource current_scope{
+      cuda::mr::any_resource<cuda::mr::device_accessible>{ambient}};
+    {
+      auto result = cudf::gather(source,
+                                 gather_map,
+                                 cudf::out_of_bounds_policy::DONT_CHECK,
+                                 stream,
+                                 rmm::device_async_resource_ref{supplied});
+      stream.synchronize();
+      EXPECT_EQ(supplied.get_bytes_counter().peak, preflight.active_phase_peak_bytes);
+      EXPECT_EQ(ambient.get_allocations_counter().total, 0);
+      EXPECT_EQ(result->num_rows(), 0);
+      EXPECT_EQ(result->num_columns(), 2);
+    }
+    stream.synchronize();
+    EXPECT_EQ(supplied.get_bytes_counter().value, 0);
+  }
+}
+
+TEST(GatherFixedWidthPreflight, OwnerPeakMatchesOutputAndTemporaryFacts)
+{
+  cudf::test::fixed_width_column_wrapper<int32_t> first{{1, 2, 3, 4}};
+  cudf::test::fixed_width_column_wrapper<float> second{{4.0F, 3.0F, 2.0F, 1.0F}, {1, 0, 1, 1}};
+  cudf::test::fixed_width_column_wrapper<int64_t> third{{4, 3, 2, 1}, {1, 1, 1, 0}};
+  cudf::test::fixed_width_column_wrapper<int32_t> gather_map{{0, 1, 2, 3}};
+  cudf::table_view source({first, second, third});
+  auto const preflight = cudf::gather_fixed_width_dont_check_preflight(source, 4, -1);
+
+  auto const upstream = cudf::get_current_device_resource_ref();
+  auto ambient        = rmm::mr::statistics_resource_adaptor{upstream};
+  auto supplied       = rmm::mr::statistics_resource_adaptor{upstream};
+  auto const stream   = cudf::test::get_default_stream();
+
+  {
+    cudf::test::scoped_current_device_resource current_scope{
+      cuda::mr::any_resource<cuda::mr::device_accessible>{ambient}};
+    {
+      auto result = cudf::gather(source,
+                                 gather_map,
+                                 cudf::out_of_bounds_policy::DONT_CHECK,
+                                 stream,
+                                 rmm::device_async_resource_ref{supplied});
+      stream.synchronize();
+      auto const expected_peak = preflight.active_phase_peak_bytes - preflight.gather_map_bytes;
+      auto const expected_live = preflight.output_data_bytes + preflight.output_null_mask_bytes;
+      EXPECT_EQ(supplied.get_bytes_counter().peak, expected_peak);
+      EXPECT_EQ(supplied.get_bytes_counter().value, expected_live);
+      EXPECT_EQ(ambient.get_allocations_counter().total, 0);
+      CUDF_TEST_EXPECT_TABLES_EQUAL(source, result->view());
+    }
+    stream.synchronize();
+    EXPECT_EQ(supplied.get_bytes_counter().value, 0);
+  }
 }

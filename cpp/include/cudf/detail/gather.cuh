@@ -112,11 +112,12 @@ void gather_helper(InputItr source_itr,
                    MapIterator gather_map_begin,
                    MapIterator gather_map_end,
                    bool nullify_out_of_bounds,
-                   rmm::cuda_stream_view stream)
+                   rmm::cuda_stream_view stream,
+                   rmm::device_async_resource_ref mr)
 {
   using map_type = typename std::iterator_traits<MapIterator>::value_type;
   if (nullify_out_of_bounds) {
-    thrust::gather_if(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+    thrust::gather_if(rmm::exec_policy_nosync(stream, mr),
                       gather_map_begin,
                       gather_map_end,
                       gather_map_begin,
@@ -124,7 +125,7 @@ void gather_helper(InputItr source_itr,
                       target_itr,
                       bounds_checker<map_type>{0, source_size});
   } else {
-    thrust::gather(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+    thrust::gather(rmm::exec_policy_nosync(stream, mr),
                    gather_map_begin,
                    gather_map_end,
                    source_itr,
@@ -219,7 +220,8 @@ struct column_gatherer_impl<Element, std::enable_if_t<is_rep_layout_compatible<E
                   gather_map_begin,
                   gather_map_end,
                   nullify_out_of_bounds,
-                  stream);
+                  stream,
+                  mr);
 
     return destination_column;
   }
@@ -413,7 +415,8 @@ struct column_gatherer_impl<dictionary32> {
       gather_map_begin,
       gather_map_end,
       nullify_out_of_bounds,
-      stream);
+      stream,
+      mr);
     return make_dictionary_column(std::move(keys_copy), std::move(new_indices), stream, mr);
   }
 };
@@ -559,12 +562,10 @@ void gather_bitmask(table_view const& source,
   std::transform(target.begin(), target.end(), target_masks.begin(), [](auto const& col) {
     return col->mutable_view().null_mask();
   });
-  auto d_target_masks =
-    make_device_uvector_async(target_masks, stream, cudf::get_current_device_resource_ref());
+  auto d_target_masks = make_device_uvector_async(target_masks, stream, mr);
 
-  auto const device_source = table_device_view::create(source, stream);
-  auto d_valid_counts      = make_zeroed_device_uvector_async<size_type>(
-    target.size(), stream, cudf::get_current_device_resource_ref());
+  auto const device_source = table_device_view::create(source, stream, mr);
+  auto d_valid_counts = make_zeroed_device_uvector_async<size_type>(target.size(), stream, mr);
 
   // Dispatch operation enum to get implementation
   auto const impl = [op]() {
