@@ -19,9 +19,11 @@
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/aligned.hpp>
 #include <rmm/exec_policy.hpp>
 #include <rmm/mr/polymorphic_allocator.hpp>
 
+#include <cuco/bucket_storage.cuh>
 #include <cuco/static_set.cuh>
 #include <cuda/iterator>
 #include <thrust/count.h>
@@ -30,6 +32,9 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -126,7 +131,91 @@ struct has_nans {
     return false;
   }
 };
+
+std::size_t checked_workspace_add(std::size_t lhs, std::size_t rhs)
+{
+  if (lhs > std::numeric_limits<std::size_t>::max() - rhs) {
+    throw std::overflow_error{"distinct-count workspace byte count overflow"};
+  }
+  return lhs + rhs;
+}
+
+std::size_t checked_workspace_mul(std::size_t lhs, std::size_t rhs)
+{
+  if (rhs != 0 && lhs > std::numeric_limits<std::size_t>::max() / rhs) {
+    throw std::overflow_error{"distinct-count workspace byte count overflow"};
+  }
+  return lhs * rhs;
+}
+
+std::size_t distinct_count_reservation_charge(std::size_t bytes)
+{
+  if (bytes == 0) { return 0; }
+  checked_workspace_add(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT - 1);
+  return rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
+}
+
+template <typename ProbingScheme>
+auto distinct_count_static_set_extent(std::size_t num_rows)
+{
+  using storage_type = cuco::storage<1>;
+  return cuco::make_valid_extent<ProbingScheme, storage_type>(
+    cuco::extent<std::size_t>{num_rows}, cudf::detail::CUCO_DESIRED_LOAD_FACTOR);
+}
+
+template <typename ProbingScheme>
+std::size_t distinct_count_static_set_storage_bytes(std::size_t num_rows)
+{
+  using storage_type = cuco::storage<1>;
+  auto const extent = distinct_count_static_set_extent<ProbingScheme>(num_rows);
+  using extent_type = std::remove_cv_t<decltype(extent)>;
+  using storage_ref_type =
+    cuco::bucket_storage_ref<cudf::size_type, storage_type::bucket_size, extent_type>;
+
+  constexpr auto alignment = storage_ref_type::alignment;
+  constexpr auto extra_slots =
+    (alignment - 1) / sizeof(cudf::size_type) + 1;
+  auto const capacity_slots = static_cast<std::size_t>(extent);
+  return checked_workspace_mul(checked_workspace_add(capacity_slots, extra_slots),
+                               sizeof(cudf::size_type));
+}
 }  // namespace
+
+distinct_count_workspace_preflight_result distinct_count_workspace_preflight_impl(
+  std::int64_t num_rows, data_type key_type, std::int64_t null_count, std::int32_t key_count)
+{
+  if (num_rows < 0) { throw std::invalid_argument{"num_rows must be non-negative"}; }
+  if (num_rows > static_cast<std::int64_t>(std::numeric_limits<size_type>::max())) {
+    throw std::overflow_error{"num_rows exceeds cudf::size_type"};
+  }
+  if (null_count != 0) { throw std::invalid_argument{"null_count must be zero"}; }
+  if (key_count != 1) { throw std::invalid_argument{"key_count must be one"}; }
+  if (not cudf::is_fixed_width(key_type) or cudf::is_nested(key_type)) {
+    throw std::invalid_argument{"distinct-count preflight requires a fixed-width non-nested key"};
+  }
+
+  if (num_rows == 0) { return {}; }
+
+  auto const rows = static_cast<size_type>(num_rows);
+  auto const synthetic_data =
+    reinterpret_cast<void const*>(static_cast<std::uintptr_t>(1));
+  auto const synthetic_column = column_view{key_type, rows, synthetic_data, nullptr, 0};
+  auto const synthetic_table = table_view{{synthetic_column}};
+
+  using preflight_probing_scheme = cuco::linear_probing<1, std::nullptr_t>;
+  distinct_count_workspace_preflight_result result;
+  result.preprocessing_retained_bytes = distinct_count_reservation_charge(
+    cudf::detail::row::equality::preprocessed_table::create_reservation_size(
+      synthetic_table, cudf::get_default_stream()));
+  result.static_set_storage_bytes = distinct_count_reservation_charge(
+    distinct_count_static_set_storage_bytes<preflight_probing_scheme>(
+      static_cast<std::size_t>(rows)));
+  result.insertion_count_bytes = distinct_count_reservation_charge(sizeof(std::size_t));
+  result.active_workspace_peak_bytes = checked_workspace_add(
+    checked_workspace_add(result.preprocessing_retained_bytes, result.static_set_storage_bytes),
+    result.insertion_count_bytes);
+  return result;
+}
 
 cudf::size_type distinct_count(table_view const& keys,
                                null_equality nulls_equal,
@@ -143,13 +232,15 @@ cudf::size_type distinct_count(table_view const& keys,
 
   auto const comparator_helper = [&](auto const row_equal) {
     using hasher_type = decltype(hash_key);
-    auto key_set      = cuco::static_set{cuco::extent{static_cast<std::size_t>(num_rows)},
-                                    cudf::detail::CUCO_DESIRED_LOAD_FACTOR,
+    using probing_scheme_type = cuco::linear_probing<1, hasher_type>;
+    auto const key_set_capacity = static_cast<std::size_t>(
+      distinct_count_static_set_extent<probing_scheme_type>(static_cast<std::size_t>(num_rows)));
+    auto key_set = cuco::static_set{cuco::extent{key_set_capacity},
                                     cuco::empty_key<cudf::size_type>{-1},
                                     row_equal,
-                                    cuco::linear_probing<1, hasher_type>{hash_key},
-                                         {},
-                                         {},
+                                    probing_scheme_type{hash_key},
+                                    {},
+                                    {},
                                     rmm::mr::polymorphic_allocator<char>{},
                                     stream.value()};
 
@@ -225,6 +316,13 @@ cudf::size_type distinct_count(column_view const& input,
 {
   CUDF_FUNC_RANGE();
   return detail::distinct_count(input, null_handling, nan_handling, stream);
+}
+
+distinct_count_workspace_preflight_result distinct_count_workspace_preflight(
+  std::int64_t num_rows, data_type key_type, std::int64_t null_count, std::int32_t key_count)
+{
+  return detail::distinct_count_workspace_preflight_impl(
+    num_rows, key_type, null_count, key_count);
 }
 
 cudf::size_type distinct_count(table_view const& input,
