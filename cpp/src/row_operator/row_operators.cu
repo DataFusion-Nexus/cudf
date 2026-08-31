@@ -27,9 +27,8 @@
 #include <cudf/utilities/type_checks.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
-#include <thrust/iterator/transform_iterator.h>
-
 #include <cuda_runtime_api.h>
+#include <thrust/iterator/transform_iterator.h>
 
 #include <algorithm>
 #include <array>
@@ -651,17 +650,15 @@ std::shared_ptr<preprocessed_table> preprocessed_table::create(
   host_span<order const> column_order,
   host_span<null_order const> null_precedence,
   bool has_ranked_children,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
 {
   check_lex_compatibility(preprocessed_input);
 
-  auto d_table        = table_device_view::create(preprocessed_input, stream);
-  auto d_column_order = detail::make_device_uvector_async(
-    column_order, stream, cudf::get_current_device_resource_ref());
-  auto d_null_precedence = detail::make_device_uvector_async(
-    null_precedence, stream, cudf::get_current_device_resource_ref());
-  auto d_depths = detail::make_device_uvector_async(
-    verticalized_col_depths, stream, cudf::get_current_device_resource_ref());
+  auto d_table           = table_device_view::create(preprocessed_input, stream, mr);
+  auto d_column_order    = detail::make_device_uvector_async(column_order, stream, mr);
+  auto d_null_precedence = detail::make_device_uvector_async(null_precedence, stream, mr);
+  auto d_depths          = detail::make_device_uvector_async(verticalized_col_depths, stream, mr);
 
   if (detail::has_nested_columns(preprocessed_input)) {
     auto [dremel_data, d_dremel_device_view] = list_lex_preprocess(preprocessed_input, stream);
@@ -689,7 +686,8 @@ std::shared_ptr<preprocessed_table> preprocessed_table::create(
   table_view const& input,
   host_span<order const> column_order,
   host_span<null_order const> null_precedence,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
 {
   auto [decomposed_input, new_column_order, new_null_precedence, verticalized_col_depths] =
     decompose_structs(input, decompose_lists_column::NO, column_order, null_precedence);
@@ -707,7 +705,7 @@ std::shared_ptr<preprocessed_table> preprocessed_table::create(
           lhs_col,
           null_precedence.empty() ? null_order::BEFORE : new_null_precedence[col_idx],
           stream,
-          cudf::get_current_device_resource_ref());
+          mr);
 
         transformed_cvs.emplace_back(std::move(transformed));
         transformed_columns.insert(transformed_columns.end(),
@@ -725,7 +723,8 @@ std::shared_ptr<preprocessed_table> preprocessed_table::create(
                 new_column_order,
                 new_null_precedence,
                 has_ranked_children,
-                stream);
+                stream,
+                mr);
 }
 
 std::pair<std::shared_ptr<preprocessed_table>, std::shared_ptr<preprocessed_table>>
@@ -795,14 +794,16 @@ preprocessed_table::create(table_view const& lhs,
                  new_column_order_lhs,
                  new_null_precedence_lhs,
                  has_ranked_children_lhs,
-                 stream),
+                 stream,
+                 cudf::get_current_device_resource_ref()),
           create(transformed_rhs,
                  std::move(verticalized_col_depths_rhs),
                  std::move(transformed_columns_rhs),
                  new_column_order_lhs,
                  new_null_precedence_lhs,
                  has_ranked_children_rhs,
-                 stream)};
+                 stream,
+                 cudf::get_current_device_resource_ref())};
 }
 
 preprocessed_table::preprocessed_table(
@@ -911,7 +912,7 @@ void scan_variable_width_rows(column_view const& offsets_child,
                               rmm::cuda_stream_view stream,
                               RowFn&& fn)
 {
-  auto const* const offsets  = offsets_child.head<Offset>();
+  auto const* const offsets    = offsets_child.head<Offset>();
   constexpr auto bits_per_word = sizeof(bitmask_type) * CHAR_BIT;
   std::array<Offset, reservation_scan_chunk_rows + 1> host_offsets{};
   std::array<bitmask_type, reservation_scan_chunk_rows / bits_per_word + 2> host_words{};
@@ -941,10 +942,10 @@ void scan_variable_width_rows(column_view const& offsets_child,
     }
     stream.synchronize();
     for (std::size_t row = 0; row < rows; ++row) {
-      auto const valid = masks.empty() ||
-                         cudf::bit_is_set(host_words.data(),
-                                          static_cast<size_type>(begin + row -
-                                                                 first_word * bits_per_word));
+      auto const valid =
+        masks.empty() ||
+        cudf::bit_is_set(host_words.data(),
+                         static_cast<size_type>(begin + row - first_word * bits_per_word));
       auto const offset_begin = static_cast<int64_t>(host_offsets[row]);
       auto const offset_end   = static_cast<int64_t>(host_offsets[row + 1]);
       CUDF_EXPECTS(offset_begin >= 0 && offset_end >= offset_begin,
@@ -963,13 +964,11 @@ void scan_node_rows(simulated_column const& node,
                     rmm::cuda_stream_view stream,
                     RowFn&& fn)
 {
-  auto const type = node.storage.type().id();
-  auto const offsets_child =
-    type == type_id::STRING
-      ? strings_column_view{node.storage}.offsets()
-      : lists_column_view{node.storage}.offsets();
-  auto const abs_begin = static_cast<std::size_t>(node.offset) + local_begin;
-  auto const abs_end   = static_cast<std::size_t>(node.offset) + local_end;
+  auto const type          = node.storage.type().id();
+  auto const offsets_child = type == type_id::STRING ? strings_column_view{node.storage}.offsets()
+                                                     : lists_column_view{node.storage}.offsets();
+  auto const abs_begin     = static_cast<std::size_t>(node.offset) + local_begin;
+  auto const abs_end       = static_cast<std::size_t>(node.offset) + local_end;
   if (type == type_id::STRING && offsets_child.type().id() == type_id::INT64) {
     scan_variable_width_rows<int64_t>(
       offsets_child, node.validity_masks, abs_begin, abs_end, stream, fn);
@@ -1053,9 +1052,7 @@ simulated_column list_element_child(simulated_column const& list_node)
 bool simulated_has_nonempty_nulls(simulated_column const& node, rmm::cuda_stream_view stream)
 {
   auto const type = node.storage.type().id();
-  if (type != type_id::STRING && type != type_id::LIST && type != type_id::STRUCT) {
-    return false;
-  }
+  if (type != type_id::STRING && type != type_id::LIST && type != type_id::STRUCT) { return false; }
   if (type == type_id::STRING || type == type_id::LIST) {
     if (simulated_dirty_gate(node)) {
       auto dirty = false;
@@ -1088,8 +1085,8 @@ simulated_column simulate_pushed_column(column_view const& col,
 {
   auto masks = std::move(ancestor_masks);
   if (col.nullable()) { masks.push_back(col.null_mask()); }
-  auto node = simulated_column{
-    col, std::move(masks), simulated_null_count::EXACT, offset, size, {}};
+  auto node =
+    simulated_column{col, std::move(masks), simulated_null_count::EXACT, offset, size, {}};
   if (col.type().id() != type_id::STRUCT) { return node; }
 
   for (auto child_it = col.child_begin(); child_it != col.child_end(); ++child_it) {
@@ -1097,8 +1094,8 @@ simulated_column simulate_pushed_column(column_view const& col,
     // The pushed child shares the pushed struct's offset and size; a nullable child of a
     // nullable struct gets a fresh ANDed mask sized on the struct's extent.
     if (!node.validity_masks.empty() && child.nullable()) {
-      mask_bytes = reservation_checked_add(
-        mask_bytes, cudf::bitmask_allocation_size_bytes(offset + size));
+      mask_bytes =
+        reservation_checked_add(mask_bytes, cudf::bitmask_allocation_size_bytes(offset + size));
     }
     if (child.type().id() == type_id::STRUCT) {
       node.children.push_back(
@@ -1121,11 +1118,11 @@ simulated_column simulate_pushed_column(column_view const& col,
 // string bytes; list element children recurse over maximal runs of selected elements.
 struct purge_accumulator {
   simulated_column node;
-  std::int64_t rows = 0;
-  std::int64_t payload = 0;
-  bool mask_retained = false;
+  std::int64_t rows      = 0;
+  std::int64_t payload   = 0;
+  bool mask_retained     = false;
   std::size_t full_begin = 0;  // full local row range backing this node; for list children it
-  std::size_t full_end = 0;    // is the span the list gather masks are computed over
+  std::size_t full_end   = 0;  // is the span the list gather masks are computed over
   std::vector<purge_accumulator> children;  // STRUCT: per child; LIST: element child (lazy)
 };
 
@@ -1156,18 +1153,16 @@ purge_accumulator make_purge_accumulator(simulated_column node,
 purge_accumulator make_list_element_accumulator(purge_accumulator const& list_acc,
                                                 rmm::cuda_stream_view stream)
 {
-  auto const& parent = list_acc.node;
+  auto const& parent       = list_acc.node;
   auto const offsets_child = lists_column_view{parent.storage}.offsets();
   auto const base          = static_cast<std::size_t>(parent.offset);
-  auto const span_begin = static_cast<std::size_t>(
+  auto const span_begin    = static_cast<std::size_t>(
     read_offset_value<int32_t>(offsets_child, base + list_acc.full_begin, stream));
   auto const span_end = static_cast<std::size_t>(
     read_offset_value<int32_t>(offsets_child, base + list_acc.full_end, stream));
-  auto acc           = make_purge_accumulator(list_element_child(parent), span_begin, span_end);
+  auto acc          = make_purge_accumulator(list_element_child(parent), span_begin, span_end);
   acc.mask_retained = std::any_of(
-    acc.node.validity_masks.begin(),
-    acc.node.validity_masks.end(),
-    [&](bitmask_type const* mask) {
+    acc.node.validity_masks.begin(), acc.node.validity_masks.end(), [&](bitmask_type const* mask) {
       return mask_has_unset_bits(mask,
                                  static_cast<std::size_t>(acc.node.offset) + span_begin,
                                  static_cast<std::size_t>(acc.node.offset) + span_end,
@@ -1192,7 +1187,7 @@ void accumulate_purged_rows(purge_accumulator& acc,
   }
   if (type != type_id::STRING && type != type_id::LIST) { return; }
 
-  auto run_open  = false;
+  auto run_open         = false;
   std::size_t run_begin = 0;
   std::size_t run_end   = 0;
   auto const flush_run  = [&] {
@@ -1203,24 +1198,27 @@ void accumulate_purged_rows(purge_accumulator& acc,
     accumulate_purged_rows(acc.children.front(), run_begin, run_end, stream);
     run_open = false;
   };
-  scan_node_rows(
-    acc.node, local_begin, local_end, stream, [&](bool valid, int64_t offset_begin, int64_t offset_end) {
-      if (valid) {
-        acc.payload += offset_end - offset_begin;
-        if (type == type_id::LIST) {
-          if (run_open && static_cast<std::size_t>(offset_begin) == run_end) {
-            run_end = static_cast<std::size_t>(offset_end);
-          } else {
-            flush_run();
-            run_begin = static_cast<std::size_t>(offset_begin);
-            run_end   = static_cast<std::size_t>(offset_end);
-            run_open  = true;
-          }
-        }
-      } else if (type == type_id::LIST) {
-        flush_run();
-      }
-    });
+  scan_node_rows(acc.node,
+                 local_begin,
+                 local_end,
+                 stream,
+                 [&](bool valid, int64_t offset_begin, int64_t offset_end) {
+                   if (valid) {
+                     acc.payload += offset_end - offset_begin;
+                     if (type == type_id::LIST) {
+                       if (run_open && static_cast<std::size_t>(offset_begin) == run_end) {
+                         run_end = static_cast<std::size_t>(offset_end);
+                       } else {
+                         flush_run();
+                         run_begin = static_cast<std::size_t>(offset_begin);
+                         run_end   = static_cast<std::size_t>(offset_end);
+                         run_open  = true;
+                       }
+                     }
+                   } else if (type == type_id::LIST) {
+                     flush_run();
+                   }
+                 });
   flush_run();
 }
 
@@ -1239,9 +1237,11 @@ std::size_t finalize_purged_column(purge_accumulator const& acc)
                               static_cast<std::size_t>(acc.payload)));
   }
   if (type == type_id::LIST) {
-    auto const child_bytes = acc.children.empty() ? 0 : finalize_purged_column(acc.children.front());
+    auto const child_bytes =
+      acc.children.empty() ? 0 : finalize_purged_column(acc.children.front());
     return reservation_checked_add(
-      bytes, reservation_checked_add(reservation_checked_mul(rows + 1, sizeof(int32_t)), child_bytes));
+      bytes,
+      reservation_checked_add(reservation_checked_mul(rows + 1, sizeof(int32_t)), child_bytes));
   }
   if (type == type_id::STRUCT) {
     auto total = bytes;
@@ -1251,8 +1251,7 @@ std::size_t finalize_purged_column(purge_accumulator const& acc)
     return total;
   }
   return reservation_checked_add(
-    bytes,
-    reservation_checked_mul(rows, cudf::size_of(acc.node.storage.type())));
+    bytes, reservation_checked_mul(rows, cudf::size_of(acc.node.storage.type())));
 }
 
 std::size_t retained_preprocessing_reservation_size(column_view const& col,
@@ -1283,9 +1282,8 @@ std::shared_ptr<preprocessed_table> preprocessed_table::create(table_view const&
 {
   check_eq_compatibility(t);
 
-  auto [null_pushed_table, nullable_data] =
-    structs::detail::push_down_nulls(t, stream, mr);
-  auto struct_offset_removed_table = remove_struct_child_offsets(null_pushed_table);
+  auto [null_pushed_table, nullable_data] = structs::detail::push_down_nulls(t, stream, mr);
+  auto struct_offset_removed_table        = remove_struct_child_offsets(null_pushed_table);
   auto verticalized_t =
     std::get<0>(decompose_structs(struct_offset_removed_table, decompose_lists_column::YES));
 
@@ -1304,12 +1302,13 @@ std::size_t preprocessed_table::create_reservation_size(table_view const& t,
   auto const struct_offset_removed_table = remove_struct_child_offsets(t);
   auto const verticalized_t =
     std::get<0>(decompose_structs(struct_offset_removed_table, decompose_lists_column::YES));
-  auto bytes = std::accumulate(verticalized_t.begin(),
-                               verticalized_t.end(),
-                               std::size_t{alignof(column_device_view) - 1},
-                               [](std::size_t init, column_view const& col) {
-                                 return reservation_checked_add(init, column_device_view::extent(col));
-                               });
+  auto bytes =
+    std::accumulate(verticalized_t.begin(),
+                    verticalized_t.end(),
+                    std::size_t{alignof(column_device_view) - 1},
+                    [](std::size_t init, column_view const& col) {
+                      return reservation_checked_add(init, column_device_view::extent(col));
+                    });
   for (auto const& col : t) {
     bytes = reservation_checked_add(bytes, retained_preprocessing_reservation_size(col, stream));
   }

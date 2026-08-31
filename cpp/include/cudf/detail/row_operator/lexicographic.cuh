@@ -17,6 +17,7 @@
 #include <cudf/structs/structs_column_device_view.cuh>
 #include <cudf/table/table_device_view.cuh>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
@@ -705,10 +706,12 @@ struct preprocessed_table {
    * @param stream The stream to launch kernels and h->d copies on while preprocessing
    * @return A shared pointer to a preprocessed table
    */
-  static std::shared_ptr<preprocessed_table> create(table_view const& table,
-                                                    host_span<order const> column_order,
-                                                    host_span<null_order const> null_precedence,
-                                                    rmm::cuda_stream_view stream);
+  static std::shared_ptr<preprocessed_table> create(
+    table_view const& table,
+    host_span<order const> column_order,
+    host_span<null_order const> null_precedence,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /**
    * @brief Preprocess tables for use with lexicographical comparison
@@ -768,7 +771,8 @@ struct preprocessed_table {
     host_span<order const> column_order,
     host_span<null_order const> null_precedence,
     bool has_ranked_children,
-    rmm::cuda_stream_view stream);
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
 
   /**
    * @brief Construct a preprocessed table for use with lexicographical comparison
@@ -925,8 +929,9 @@ class self_comparator {
   self_comparator(table_view const& t,
                   host_span<order const> column_order         = {},
                   host_span<null_order const> null_precedence = {},
-                  rmm::cuda_stream_view stream                = cudf::get_default_stream())
-    : d_t{preprocessed_table::create(t, column_order, null_precedence, stream)}
+                  rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+                  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
+    : d_t{preprocessed_table::create(t, column_order, null_precedence, stream, mr)}
   {
   }
 

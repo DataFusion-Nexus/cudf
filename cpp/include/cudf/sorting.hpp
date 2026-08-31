@@ -39,6 +39,13 @@ struct sorted_order_radix_preflight_result {
   std::size_t active_phase_peak_bytes{0};
 };
 
+struct sorted_order_lexicographic_preflight_result {
+  std::size_t comparator_state_bytes{0};
+  std::size_t temporary_workspace_bytes{0};
+  std::size_t retained_order_bytes{0};
+  std::size_t active_phase_peak_bytes{0};
+};
+
 /**
  * @brief Query the owner allocation shape for the unstable one-key radix path.
  *
@@ -58,6 +65,15 @@ sorted_order_radix_preflight(std::int64_t num_rows,
                              bool stable,
                              order key_order,
                              std::int32_t device);
+
+CUDF_EXPORT sorted_order_lexicographic_preflight_result
+sorted_order_lexicographic_preflight(std::int64_t num_rows,
+                                     std::vector<data_type> const& key_types,
+                                     std::vector<std::int64_t> const& null_counts,
+                                     bool stable,
+                                     std::vector<order> const& key_orders,
+                                     std::vector<null_order> const& null_precedence,
+                                     std::int32_t device);
 
 /**
  * @addtogroup column_sort

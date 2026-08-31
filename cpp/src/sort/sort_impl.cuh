@@ -12,13 +12,43 @@
 #include <cudf/detail/row_operator/lexicographic.cuh>
 #include <cudf/utilities/memory_resource.hpp>
 
-#include <rmm/exec_policy.hpp>
+#include <cub/device/device_merge_sort.cuh>
+#include <cuda/iterator>
+#include <cuda/std/optional>
 
-#include <thrust/sequence.h>
-#include <thrust/sort.h>
+#include <type_traits>
+#include <utility>
 
 namespace cudf {
 namespace detail {
+
+template <typename Comparator>
+struct queryable_lexicographic_comparator {
+  cuda::std::optional<Comparator> comparator{};
+
+  queryable_lexicographic_comparator() = default;
+  explicit queryable_lexicographic_comparator(Comparator value) : comparator{std::move(value)} {}
+
+  __device__ bool operator()(size_type lhs, size_type rhs) const { return (*comparator)(lhs, rhs); }
+};
+
+template <sort_method method, typename Comparator>
+std::size_t sorted_order_lexicographic_temp_storage_bytes(size_type num_rows,
+                                                          Comparator comparator,
+                                                          rmm::cuda_stream_view stream)
+{
+  auto temporary_bytes = std::size_t{0};
+  auto input           = cuda::counting_iterator<size_type>{0};
+  auto* output         = static_cast<size_type*>(nullptr);
+  if constexpr (method == sort_method::STABLE) {
+    cub::DeviceMergeSort::StableSortKeysCopy(
+      nullptr, temporary_bytes, input, output, num_rows, comparator, stream.value());
+  } else {
+    cub::DeviceMergeSort::SortKeysCopy(
+      nullptr, temporary_bytes, input, output, num_rows, comparator, stream.value());
+  }
+  return temporary_bytes;
+}
 
 /**
  * @copydoc
@@ -61,29 +91,36 @@ std::unique_ptr<column> sorted_order(table_view input,
   std::unique_ptr<column> sorted_indices = cudf::make_numeric_column(
     data_type(type_to_id<size_type>()), input.num_rows(), mask_state::UNALLOCATED, stream, mr);
   mutable_column_view mutable_indices_view = sorted_indices->mutable_view();
-  thrust::sequence(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-                   mutable_indices_view.begin<size_type>(),
-                   mutable_indices_view.end<size_type>(),
-                   0);
-
-  auto const do_sort = [&](auto const comparator) {
-    // Compiling `thrust::*sort*` APIs is expensive.
-    // Thus, we should optimize that by using constexpr condition to only compile what we need.
+  auto const do_sort                       = [&](auto const comparator) {
+    using queryable_comparator =
+      queryable_lexicographic_comparator<std::remove_cvref_t<decltype(comparator)>>;
+    auto const queryable = queryable_comparator{comparator};
+    auto temporary_bytes =
+      sorted_order_lexicographic_temp_storage_bytes<method>(input.num_rows(), queryable, stream);
+    auto temporary      = rmm::device_buffer(temporary_bytes, stream, mr);
+    auto input_indices  = cuda::counting_iterator<size_type>{0};
+    auto output_indices = mutable_indices_view.begin<size_type>();
     if constexpr (method == sort_method::STABLE) {
-      thrust::stable_sort(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-                          mutable_indices_view.begin<size_type>(),
-                          mutable_indices_view.end<size_type>(),
-                          comparator);
+      cub::DeviceMergeSort::StableSortKeysCopy(temporary.data(),
+                                               temporary_bytes,
+                                               input_indices,
+                                               output_indices,
+                                               input.num_rows(),
+                                               queryable,
+                                               stream.value());
     } else {
-      thrust::sort(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-                   mutable_indices_view.begin<size_type>(),
-                   mutable_indices_view.end<size_type>(),
-                   comparator);
+      cub::DeviceMergeSort::SortKeysCopy(temporary.data(),
+                                         temporary_bytes,
+                                         input_indices,
+                                         output_indices,
+                                         input.num_rows(),
+                                         queryable,
+                                         stream.value());
     }
   };
 
-  auto const comp =
-    cudf::detail::row::lexicographic::self_comparator(input, column_order, null_precedence, stream);
+  auto const comp = cudf::detail::row::lexicographic::self_comparator(
+    input, column_order, null_precedence, stream, mr);
   if (cudf::detail::has_nested_columns(input)) {
     auto const comparator = comp.less<true>(nullate::DYNAMIC{has_nested_nulls(input)});
     do_sort(comparator);
