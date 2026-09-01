@@ -58,6 +58,7 @@ bool gather_fixed_width_dispatchable(data_type type)
 gather_fixed_width_dont_check_preflight_result gather_fixed_width_dont_check_preflight_impl(
   std::int64_t output_rows,
   std::vector<gather_fixed_width_column_metadata> const& source_columns,
+  std::size_t output_data_bytes_upper_bound,
   std::int32_t)
 {
   CUDF_EXPECTS(output_rows >= 0,
@@ -66,9 +67,11 @@ gather_fixed_width_dont_check_preflight_result gather_fixed_width_dont_check_pre
                "gather fixed-width DONT_CHECK preflight rows exceed cudf::size_type");
 
   gather_fixed_width_dont_check_preflight_result result{};
-  auto const rows         = static_cast<std::size_t>(output_rows);
-  auto const column_count = source_columns.size();
-  bool any_nullable       = false;
+  auto const rows                       = static_cast<std::size_t>(output_rows);
+  auto const column_count               = source_columns.size();
+  bool any_nullable                     = false;
+  bool any_string                       = false;
+  std::size_t minimum_output_data_bytes = 0;
 
   result.gather_map_bytes = checked_byte_product(
     rows, sizeof(size_type), "gather fixed-width DONT_CHECK map byte count overflowed");
@@ -78,21 +81,27 @@ gather_fixed_width_dont_check_preflight_result gather_fixed_width_dont_check_pre
                  "gather fixed-width DONT_CHECK preflight child count must be non-negative");
     CUDF_EXPECTS(column.num_children == 0,
                  "gather fixed-width DONT_CHECK preflight does not support nested columns");
-    CUDF_EXPECTS(cudf::is_fixed_width(column.type),
-                 "gather fixed-width DONT_CHECK preflight requires fixed-width columns");
+    CUDF_EXPECTS(
+      cudf::is_fixed_width(column.type) || column.type.id() == type_id::STRING,
+      "gather fixed-width DONT_CHECK preflight requires flat fixed-width or string columns");
     CUDF_EXPECTS(not cudf::is_fixed_point(column.type),
                  "gather fixed-width DONT_CHECK preflight does not support decimal columns");
-    CUDF_EXPECTS(gather_fixed_width_dispatchable(column.type),
-                 "gather fixed-width DONT_CHECK preflight type is not gather-dispatchable");
+    CUDF_EXPECTS(
+      column.type.id() == type_id::STRING || gather_fixed_width_dispatchable(column.type),
+      "gather fixed-width DONT_CHECK preflight type is not gather-dispatchable");
 
     auto const column_bytes =
-      checked_byte_product(rows,
-                           cudf::size_of(column.type),
-                           "gather fixed-width DONT_CHECK output byte count overflowed");
-    result.output_data_bytes =
-      checked_byte_sum(result.output_data_bytes,
+      column.type.id() == type_id::STRING
+        ? checked_byte_product(
+            rows + 1, sizeof(size_type), "gather string offset byte count overflowed")
+        : checked_byte_product(rows,
+                               cudf::size_of(column.type),
+                               "gather fixed-width DONT_CHECK output byte count overflowed");
+    minimum_output_data_bytes =
+      checked_byte_sum(minimum_output_data_bytes,
                        column_bytes,
-                       "gather fixed-width DONT_CHECK output byte sum overflowed");
+                       "gather fixed-width DONT_CHECK minimum output byte sum overflowed");
+    any_string = any_string || column.type.id() == type_id::STRING;
 
     if (column.nullable) {
       any_nullable = true;
@@ -104,6 +113,12 @@ gather_fixed_width_dont_check_preflight_result gather_fixed_width_dont_check_pre
                          "gather fixed-width DONT_CHECK output null-mask byte sum overflowed");
     }
   }
+
+  CUDF_EXPECTS(output_data_bytes_upper_bound >= minimum_output_data_bytes,
+               "gather DONT_CHECK output data upper bound is smaller than the schema minimum");
+  CUDF_EXPECTS(any_string || output_data_bytes_upper_bound == minimum_output_data_bytes,
+               "gather fixed-width DONT_CHECK output data upper bound must be exact");
+  result.output_data_bytes = output_data_bytes_upper_bound;
 
   if (any_nullable) {
     result.target_mask_pointer_array_bytes = checked_byte_product(
@@ -227,9 +242,11 @@ std::unique_ptr<table> gather(table_view const& source_table,
 gather_fixed_width_dont_check_preflight_result gather_fixed_width_dont_check_preflight(
   std::int64_t output_rows,
   std::vector<gather_fixed_width_column_metadata> const& source_columns,
+  std::size_t output_data_bytes_upper_bound,
   std::int32_t device)
 {
-  return detail::gather_fixed_width_dont_check_preflight_impl(output_rows, source_columns, device);
+  return detail::gather_fixed_width_dont_check_preflight_impl(
+    output_rows, source_columns, output_data_bytes_upper_bound, device);
 }
 
 gather_fixed_width_dont_check_preflight_result gather_fixed_width_dont_check_preflight(
@@ -240,7 +257,19 @@ gather_fixed_width_dont_check_preflight_result gather_fixed_width_dont_check_pre
   for (auto const& column : source_table) {
     source_columns.push_back({column.type(), column.nullable(), column.num_children()});
   }
-  return detail::gather_fixed_width_dont_check_preflight_impl(output_rows, source_columns, device);
+  std::size_t output_data_bytes = 0;
+  for (auto const& column : source_columns) {
+    CUDF_EXPECTS(column.type.id() != type_id::STRING,
+                 "table-view string gather preflight requires an explicit output data upper bound");
+    output_data_bytes = detail::checked_byte_sum(
+      output_data_bytes,
+      detail::checked_byte_product(static_cast<std::size_t>(output_rows),
+                                   cudf::size_of(column.type),
+                                   "gather fixed-width DONT_CHECK output byte count overflowed"),
+      "gather fixed-width DONT_CHECK output byte sum overflowed");
+  }
+  return detail::gather_fixed_width_dont_check_preflight_impl(
+    output_rows, source_columns, output_data_bytes, device);
 }
 
 }  // namespace cudf

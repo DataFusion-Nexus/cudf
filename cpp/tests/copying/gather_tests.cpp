@@ -302,7 +302,7 @@ TEST(GatherFixedWidthPreflight, ZeroRowsKeepNullableOwnerTemporaries)
     {cudf::data_type{cudf::type_id::INT32}, false, 0},
     {cudf::data_type{cudf::type_id::FLOAT32}, true, 0},
     {cudf::data_type{cudf::type_id::INT64}, true, 0}};
-  auto const result = cudf::gather_fixed_width_dont_check_preflight(0, columns, -1);
+  auto const result = cudf::gather_fixed_width_dont_check_preflight(0, columns, 0, -1);
 
   auto const expected_pointer_bytes = columns.size() * sizeof(cudf::bitmask_type*);
   auto const expected_view_bytes =
@@ -322,7 +322,8 @@ TEST(GatherFixedWidthPreflight, ZeroRowsKeepNullableOwnerTemporaries)
 
   std::vector<cudf::gather_fixed_width_column_metadata> non_nullable{
     {cudf::data_type{cudf::type_id::INT32}, false, 0}};
-  auto const empty_result = cudf::gather_fixed_width_dont_check_preflight(0, non_nullable, device);
+  auto const empty_result =
+    cudf::gather_fixed_width_dont_check_preflight(0, non_nullable, 0, device);
   EXPECT_EQ(empty_result.active_phase_peak_bytes, 0);
   EXPECT_EQ(empty_result.native_temporary_workspace_bytes, 0);
 }
@@ -334,11 +335,11 @@ TEST(GatherFixedWidthPreflight, SupportedTypesAndCheckedComponents)
     {cudf::data_type{cudf::type_id::INT32}, true, 0},
     {cudf::data_type{cudf::type_id::FLOAT64}, true, 0}};
   constexpr std::int64_t rows{7};
-  auto const result = cudf::gather_fixed_width_dont_check_preflight(rows, columns, 0);
-
   auto const expected_map_bytes = static_cast<std::size_t>(rows) * sizeof(cudf::size_type);
   auto const expected_data_bytes =
     static_cast<std::size_t>(rows) * (sizeof(std::int8_t) + sizeof(std::int32_t) + sizeof(double));
+  auto const result =
+    cudf::gather_fixed_width_dont_check_preflight(rows, columns, expected_data_bytes, 0);
   auto const expected_mask_bytes    = 2 * cudf::bitmask_allocation_size_bytes(rows);
   auto const expected_pointer_bytes = columns.size() * sizeof(cudf::bitmask_type*);
   auto const expected_view_bytes =
@@ -357,6 +358,13 @@ TEST(GatherFixedWidthPreflight, SupportedTypesAndCheckedComponents)
   EXPECT_EQ(result.valid_count_array_bytes, expected_count_bytes);
   EXPECT_EQ(result.native_temporary_workspace_bytes, expected_temporary_bytes);
   EXPECT_EQ(result.active_phase_peak_bytes, expected_peak);
+
+  std::vector<cudf::gather_fixed_width_column_metadata> strings{
+    {cudf::data_type{cudf::type_id::STRING}, false, 0}};
+  auto const bounded_string = cudf::gather_fixed_width_dont_check_preflight(rows, strings, 83, 0);
+  EXPECT_EQ(bounded_string.output_data_bytes, 83);
+  EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(rows, strings, 31, 0),
+               cudf::logic_error);
 }
 
 TEST(GatherFixedWidthPreflight, MetadataAndTableViewOverloadsAgree)
@@ -368,7 +376,7 @@ TEST(GatherFixedWidthPreflight, MetadataAndTableViewOverloadsAgree)
     {cudf::data_type{cudf::type_id::INT32}, false, 0},
     {cudf::data_type{cudf::type_id::FLOAT32}, true, 0}};
 
-  auto const metadata_result = cudf::gather_fixed_width_dont_check_preflight(3, columns, 0);
+  auto const metadata_result = cudf::gather_fixed_width_dont_check_preflight(3, columns, 24, 0);
   auto const table_result    = cudf::gather_fixed_width_dont_check_preflight(source, 3, -1);
   expect_same_preflight(metadata_result, table_result);
 }
@@ -383,7 +391,8 @@ TEST(GatherFixedWidthPreflight, MetadataQueryDoesNotAllocate)
   {
     cudf::test::scoped_current_device_resource current_scope{
       cuda::mr::any_resource<cuda::mr::device_accessible>{target}};
-    auto const result = cudf::gather_fixed_width_dont_check_preflight(4096, columns, -1);
+    auto const result =
+      cudf::gather_fixed_width_dont_check_preflight(4096, columns, 4096 * sizeof(std::int32_t), -1);
     EXPECT_GT(result.active_phase_peak_bytes, 0);
     EXPECT_EQ(target.get_allocations_counter().total, 0);
   }
@@ -405,12 +414,12 @@ TEST(GatherFixedWidthPreflight, MetadataVectorAggregatesAtRowLimitDoNotAllocate)
   {
     cudf::test::scoped_current_device_resource current_scope{
       cuda::mr::any_resource<cuda::mr::device_accessible>{target}};
-    auto const result = cudf::gather_fixed_width_dont_check_preflight(
-      static_cast<std::int64_t>(max_rows), columns, -1);
+    auto const expected_data_bytes = max_rows * (sizeof(std::int8_t) + sizeof(std::int16_t) +
+                                                 sizeof(std::int32_t) + sizeof(std::int64_t));
+    auto const result              = cudf::gather_fixed_width_dont_check_preflight(
+      static_cast<std::int64_t>(max_rows), columns, expected_data_bytes, -1);
     auto const expected_mask_bytes =
       cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(max_rows));
-    auto const expected_data_bytes    = max_rows * (sizeof(std::int8_t) + sizeof(std::int16_t) +
-                                                 sizeof(std::int32_t) + sizeof(std::int64_t));
     auto const expected_masks         = columns.size() * expected_mask_bytes;
     auto const expected_pointer_bytes = columns.size() * sizeof(cudf::bitmask_type*);
     auto const expected_view_bytes =
@@ -441,21 +450,22 @@ TEST(GatherFixedWidthPreflight, RejectsUnsupportedMetadataWithoutAllocation)
       cuda::mr::any_resource<cuda::mr::device_accessible>{target}};
     std::vector<cudf::gather_fixed_width_column_metadata> columns{
       {cudf::data_type{cudf::type_id::INT32}, false, 0}};
-    EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(-1, columns, -1), cudf::logic_error);
-    EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(
-                   std::numeric_limits<std::int64_t>::max(), columns, -1),
+    EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(-1, columns, 0, -1),
                  cudf::logic_error);
     EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(
-                   4, {{cudf::data_type{cudf::type_id::DECIMAL32, -2}, false, 0}}, -1),
+                   std::numeric_limits<std::int64_t>::max(), columns, 0, -1),
                  cudf::logic_error);
     EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(
-                   4, {{cudf::data_type{cudf::type_id::LIST}, false, 1}}, -1),
+                   4, {{cudf::data_type{cudf::type_id::DECIMAL32, -2}, false, 0}}, 0, -1),
                  cudf::logic_error);
     EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(
-                   4, {{cudf::data_type{cudf::type_id::STRING}, false, 0}}, -1),
+                   4, {{cudf::data_type{cudf::type_id::LIST}, false, 1}}, 0, -1),
                  cudf::logic_error);
     EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(
-                   4, {{cudf::data_type{cudf::type_id::INT32}, false, -1}}, -1),
+                   4, {{cudf::data_type{cudf::type_id::STRING}, false, 0}}, 0, -1),
+                 cudf::logic_error);
+    EXPECT_THROW(cudf::gather_fixed_width_dont_check_preflight(
+                   4, {{cudf::data_type{cudf::type_id::INT32}, false, -1}}, 16, -1),
                  cudf::logic_error);
     EXPECT_EQ(target.get_allocations_counter().total, 0);
   }

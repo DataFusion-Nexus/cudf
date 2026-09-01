@@ -80,11 +80,12 @@ struct gather_fixed_width_dont_check_preflight_result {
 };
 
 /**
- * @brief Query the owner allocation shape for a flat fixed-width DONT_CHECK gather.
+ * @brief Query the owner allocation shape for a flat DONT_CHECK gather.
  *
  * No stream, memory resource, column, or device allocation is required. The
- * metadata must describe only top-level fixed-width non-decimal columns with
- * no children.
+ * metadata must describe only top-level fixed-width non-decimal or string
+ * columns with no children. String columns require a hard output-data upper
+ * bound; fixed-width columns require the exact output-data byte count.
  *
  * @throws cudf::logic_error when the shape is unsupported or a checked byte
  * calculation overflows.
@@ -92,6 +93,7 @@ struct gather_fixed_width_dont_check_preflight_result {
 CUDF_EXPORT gather_fixed_width_dont_check_preflight_result gather_fixed_width_dont_check_preflight(
   std::int64_t output_rows,
   std::vector<gather_fixed_width_column_metadata> const& source_columns,
+  std::size_t output_data_bytes_upper_bound,
   std::int32_t device);
 
 /**

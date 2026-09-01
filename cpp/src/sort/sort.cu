@@ -139,8 +139,8 @@ sorted_order_lexicographic_preflight_result sorted_order_lexicographic_preflight
   CUDF_EXPECTS(num_rows >= 0, "sorted-order lexicographic rows must be non-negative");
   CUDF_EXPECTS(num_rows <= std::numeric_limits<size_type>::max(),
                "sorted-order lexicographic rows exceed cudf::size_type");
-  CUDF_EXPECTS(key_types.size() >= 2,
-               "sorted-order lexicographic preflight requires at least two keys");
+  CUDF_EXPECTS(!key_types.empty(),
+               "sorted-order lexicographic preflight requires at least one key");
   CUDF_EXPECTS(key_types.size() == null_counts.size() && key_types.size() == key_orders.size() &&
                  key_types.size() == null_precedence.size(),
                "sorted-order lexicographic metadata lengths differ");
