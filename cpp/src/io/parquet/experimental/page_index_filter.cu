@@ -1057,10 +1057,11 @@ thrust::host_vector<bool> aggregate_reader_metadata::compute_data_page_mask(
     // task submission overheads
     auto constexpr max_tasks         = 2;
     using task_page_row_offsets_type = std::vector<std::pair<std::vector<size_type>, size_type>>;
-    std::vector<std::future<task_page_row_offsets_type>> page_row_offset_tasks{};
-    page_row_offset_tasks.reserve(max_tasks);
     auto const cols_per_thread =
       cudf::util::div_rounding_up_safe<std::size_t>(num_columns, max_tasks);
+    std::vector<std::future<task_page_row_offsets_type>> page_row_offset_tasks{};
+    cudf::detail::future_drain_guard task_drain{page_row_offset_tasks};
+    page_row_offset_tasks.reserve(max_tasks);
 
     // Submit page row offset compute tasks
     std::transform(cuda::counting_iterator<int>{0},
@@ -1084,8 +1085,7 @@ thrust::host_vector<bool> aggregate_reader_metadata::compute_data_page_mask(
                      });
                    });
 
-    std::for_each(page_row_offset_tasks.begin(), page_row_offset_tasks.end(), [&](auto& task) {
-      auto const& task_page_row_offsets = task.get();
+    cudf::detail::get_all_futures(page_row_offset_tasks, [&](auto task_page_row_offsets) {
       for (auto& [col_page_row_offsets, col_max_page_size] : task_page_row_offsets) {
         page_row_offsets.insert(page_row_offsets.end(),
                                 std::make_move_iterator(col_page_row_offsets.begin()),

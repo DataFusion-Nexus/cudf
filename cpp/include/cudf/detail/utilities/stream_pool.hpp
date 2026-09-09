@@ -75,6 +75,25 @@ class cuda_stream_pool {
 };
 
 /**
+ * @brief Provider used to route forked streams to an owning execution context.
+ *
+ * The provider is consulted only after it has been installed. Returning an
+ * empty vector for a non-zero count is invalid; the provider must return
+ * exactly `count` views and may repeat views when its bounded set is smaller
+ * than the requested count.
+ */
+using stream_provider_fn = std::vector<rmm::cuda_stream_view> (*)(rmm::cuda_stream_view,
+                                                                   std::size_t);
+
+/**
+ * @brief Install the process-local fork-stream provider.
+ *
+ * Installation is idempotent for the same function pointer. A different
+ * provider cannot replace an installed provider while libcudf may be using it.
+ */
+void install_stream_provider(stream_provider_fn provider);
+
+/**
  * @brief Initialize global stream pool.
  */
 cuda_stream_pool* create_global_cuda_stream_pool();

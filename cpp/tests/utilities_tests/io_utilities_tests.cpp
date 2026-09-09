@@ -6,7 +6,15 @@
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_wrapper.hpp>
 
+#include <cudf/detail/utilities/host_worker_pool.hpp>
+#include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/utilities/default_stream.hpp>
+
 #include <src/io/utilities/base64_utilities.hpp>
+
+#include <atomic>
+#include <future>
+#include <stdexcept>
 
 using cudf::io::detail::base64_decode;
 using cudf::io::detail::base64_encode;
@@ -122,4 +130,41 @@ TEST(IoUtilitiesTest, Base64EncodeAndDecode)
 
   // Check equal columns
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, results);
+}
+
+TEST(IoUtilitiesTest, HostWorkerFutureDrainPreservesPrimaryFailure)
+{
+  std::atomic<bool> cleanup_task_ran{false};
+  std::vector<std::future<void>> futures;
+
+  {
+    cudf::detail::future_drain_guard guard{futures};
+    futures.emplace_back(
+      std::async(std::launch::deferred, [] { throw std::runtime_error{"primary"}; }));
+    futures.emplace_back(std::async(std::launch::async, [&cleanup_task_ran] {
+      cleanup_task_ran.store(true);
+      throw std::logic_error{"cleanup"};
+    }));
+
+    try {
+      cudf::detail::get_all_futures(futures);
+      FAIL();
+    } catch (std::runtime_error const& error) {
+      EXPECT_STREQ(error.what(), "primary");
+    }
+  }
+
+  EXPECT_TRUE(cleanup_task_ran.load());
+}
+
+TEST(IoUtilitiesTest, ForkStreamsUsesUpstreamPoolWithoutProvider)
+{
+  auto const parent  = cudf::get_default_stream();
+  auto const streams = cudf::detail::fork_streams(parent, 3);
+
+  ASSERT_EQ(streams.size(), 3);
+  for (auto const stream : streams) {
+    EXPECT_NE(stream.value(), cudaStream_t{nullptr});
+  }
+  cudf::detail::join_streams(streams, parent);
 }

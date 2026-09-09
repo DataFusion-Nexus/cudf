@@ -5,6 +5,8 @@
 
 #include "parquet_common.hpp"
 
+#include <src/io/parquet/compact_protocol_reader.hpp>
+
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/table_utilities.hpp>
 
@@ -14,7 +16,112 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <vector>
+
+namespace {
+
+std::atomic<bool> struct_list_task_submitted{false};
+std::atomic<bool> skip_failure_reached{false};
+std::atomic<bool> struct_list_worker_started{false};
+std::atomic<bool> struct_list_ranges_destroyed{false};
+std::atomic<bool> struct_list_worker_finished{false};
+std::atomic<bool> worker_observed_destroyed_ranges{false};
+
+void compact_protocol_reader_failure_hook(
+  cudf::io::parquet::detail::compact_protocol_reader_test_event event)
+{
+  using event_type = cudf::io::parquet::detail::compact_protocol_reader_test_event;
+  if (event == event_type::struct_list_ranges_destroyed) {
+    struct_list_ranges_destroyed.store(true, std::memory_order_release);
+    return;
+  }
+  if (event == event_type::struct_list_task_submitted) {
+    struct_list_task_submitted.store(true, std::memory_order_release);
+    return;
+  }
+  if (event == event_type::struct_list_worker_start) {
+    struct_list_worker_started.store(true, std::memory_order_release);
+    while (!skip_failure_reached.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    // The main thread is now unwinding. Give it a bounded window to reach the
+    // scope exit: if `all_ranges` is destroyed while this worker is still
+    // parked here, every read the worker performs next is a use-after-free.
+    // With the drain guard destroyed last, that window closes on the drain
+    // itself and this wait must time out.
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{250};
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (struct_list_ranges_destroyed.load(std::memory_order_acquire)) {
+        worker_observed_destroyed_ranges.store(true, std::memory_order_release);
+        break;
+      }
+      std::this_thread::yield();
+    }
+    struct_list_worker_finished.store(true, std::memory_order_release);
+    return;
+  }
+
+  if (struct_list_task_submitted.load(std::memory_order_acquire)) {
+    while (!struct_list_worker_started.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    skip_failure_reached.store(true, std::memory_order_release);
+    throw cudf::logic_error{"injected skip_struct_field failure"};
+  }
+}
+
+struct compact_protocol_reader_hook_guard {
+  ~compact_protocol_reader_hook_guard()
+  {
+    cudf::io::parquet::detail::set_compact_protocol_reader_test_hook(nullptr);
+  }
+};
+
+}  // namespace
+
+TEST(CompactProtocolReaderTest, DrainsSubmittedWorkerBeforeCapturedRangesAreDestroyed)
+{
+  using cudf::io::parquet::FileMetaData;
+  using cudf::io::parquet::detail::CompactProtocolReader;
+
+  constexpr std::size_t num_structs = 513;
+
+  std::vector<uint8_t> encoded{0x49, 0xfc, 0x81, 0x04};
+  encoded.resize(encoded.size() + num_structs, 0);
+  encoded.push_back(0);
+
+  struct_list_task_submitted.store(false, std::memory_order_relaxed);
+  skip_failure_reached.store(false, std::memory_order_relaxed);
+  struct_list_worker_started.store(false, std::memory_order_relaxed);
+  struct_list_ranges_destroyed.store(false, std::memory_order_relaxed);
+  struct_list_worker_finished.store(false, std::memory_order_relaxed);
+  worker_observed_destroyed_ranges.store(false, std::memory_order_relaxed);
+  cudf::io::parquet::detail::set_compact_protocol_reader_test_hook(
+    compact_protocol_reader_failure_hook);
+  compact_protocol_reader_hook_guard hook_guard;
+
+  FileMetaData metadata;
+  CompactProtocolReader reader{encoded.data(), encoded.size()};
+  EXPECT_THROW(
+    {
+      try {
+        reader.read(&metadata);
+      } catch (cudf::logic_error const& error) {
+        EXPECT_STREQ(error.what(), "injected skip_struct_field failure");
+        throw;
+      }
+    },
+    cudf::logic_error);
+  EXPECT_TRUE(struct_list_worker_started.load(std::memory_order_acquire));
+  EXPECT_TRUE(struct_list_task_submitted.load(std::memory_order_acquire));
+  EXPECT_TRUE(skip_failure_reached.load(std::memory_order_acquire));
+  EXPECT_TRUE(struct_list_worker_finished.load(std::memory_order_acquire));
+  EXPECT_TRUE(struct_list_ranges_destroyed.load(std::memory_order_acquire));
+  EXPECT_FALSE(worker_observed_destroyed_ranges.load(std::memory_order_acquire));
+}
 
 ////////////////////////////////
 // delta encoding writer tests

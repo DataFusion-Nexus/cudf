@@ -78,6 +78,7 @@ auto dispatch_fetch_tasks(std::size_t num_sources, Task fetch_task)
   } else {
     // Dispatch the tasks to the host worker pool
     std::vector<std::future<result_type>> tasks;
+    cudf::detail::future_drain_guard task_drain{tasks};
     tasks.reserve(num_sources);
     std::for_each(cuda::counting_iterator<std::size_t>(0),
                   cuda::counting_iterator<std::size_t>(num_sources),
@@ -85,9 +86,8 @@ auto dispatch_fetch_tasks(std::size_t num_sources, Task fetch_task)
                     tasks.emplace_back(cudf::detail::host_worker_pool().submit_task(
                       [&fetch_task, source_idx]() { return fetch_task(source_idx); }));
                   });
-    std::transform(tasks.begin(), tasks.end(), std::back_inserter(results), [](auto& task) {
-      return task.get();
-    });
+    cudf::detail::get_all_futures(tasks,
+                                  [&](auto result) { results.emplace_back(std::move(result)); });
   }
   return results;
 }
@@ -353,6 +353,7 @@ fetch_byte_ranges_to_device_async_impl(
   // Vectors to hold futures from datasource
   std::vector<std::future<size_t>> device_read_tasks{};
   std::vector<std::future<host_read_buffer>> host_read_tasks{};
+  cudf::detail::future_drain_guard host_read_task_drain{host_read_tasks};
   device_read_tasks.reserve(read_schedule.size());
   host_read_tasks.reserve(read_schedule.size());
 
@@ -393,10 +394,10 @@ fetch_byte_ranges_to_device_async_impl(
     copy_srcs.reserve(host_read_tasks.size());
     host_buffers.reserve(host_read_tasks.size());
 
-    for (auto& task : host_read_tasks) {
-      host_buffers.emplace_back(task.get());
+    cudf::detail::get_all_futures(host_read_tasks, [&](auto buffer) {
+      host_buffers.emplace_back(std::move(buffer));
       copy_srcs.push_back(host_buffers.back().get()->data());
-    }
+    });
   }
 
   // `device_read_async` is not guaranteed to follow stream-ordering (see datasource API docs)
@@ -427,9 +428,7 @@ fetch_byte_ranges_to_device_async_impl(
   if (not host_buffers.empty()) { stream.synchronize(); }
 
   auto sync_function = [](decltype(device_read_tasks) device_read_tasks) {
-    for (auto& task : device_read_tasks) {
-      task.get();
-    }
+    cudf::detail::get_all_futures(device_read_tasks);
   };
   return {std::move(column_chunk_buffers),
           std::move(column_chunk_data_per_source),

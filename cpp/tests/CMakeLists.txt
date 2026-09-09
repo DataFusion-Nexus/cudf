@@ -238,6 +238,7 @@ ConfigureTest(
   reductions/list_rank_test.cpp
   reductions/rank_tests.cpp
   reductions/reduction_tests.cpp
+  reductions/static_set_size_test.cu
   reductions/scan_tests.cpp
   reductions/segmented_reduction_tests.cpp
   reductions/tdigest_tests.cpp

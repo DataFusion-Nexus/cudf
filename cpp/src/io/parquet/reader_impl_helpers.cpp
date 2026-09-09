@@ -542,6 +542,7 @@ void metadata::setup_page_index(cudf::host_span<uint8_t const> page_index_bytes,
     auto const remainder              = total_column_chunks % num_tasks;
 
     std::vector<std::future<void>> tasks;
+    cudf::detail::future_drain_guard task_drain{tasks};
     tasks.reserve(num_tasks);
 
     std::size_t start_idx = 0;
@@ -563,9 +564,7 @@ void metadata::setup_page_index(cudf::host_span<uint8_t const> page_index_bytes,
       start_idx = end_idx;
     }
 
-    for (auto& task : tasks) {
-      task.get();
-    }
+    cudf::detail::get_all_futures(tasks);
   } else {
     CompactProtocolReader cp(page_index_bytes.data(), page_index_bytes.size());
     // For small numbers of columns, use sequential processing to avoid overhead
@@ -601,6 +600,7 @@ std::vector<metadata> aggregate_reader_metadata::metadatas_from_sources(
   }
 
   std::vector<std::future<metadata>> metadata_ctor_tasks;
+  cudf::detail::future_drain_guard task_drain{metadata_ctor_tasks};
   metadata_ctor_tasks.reserve(sources.size());
   for (auto const& source : sources) {
     metadata_ctor_tasks.emplace_back(cudf::detail::host_worker_pool().submit_task(
@@ -608,10 +608,8 @@ std::vector<metadata> aggregate_reader_metadata::metadatas_from_sources(
   }
   std::vector<metadata> metadatas;
   metadatas.reserve(sources.size());
-  std::transform(metadata_ctor_tasks.begin(),
-                 metadata_ctor_tasks.end(),
-                 std::back_inserter(metadatas),
-                 [](std::future<metadata>& task) { return std::move(task).get(); });
+  cudf::detail::get_all_futures(metadata_ctor_tasks,
+                                [&](auto result) { metadatas.emplace_back(std::move(result)); });
   return metadatas;
 }
 

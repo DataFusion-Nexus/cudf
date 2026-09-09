@@ -17,6 +17,13 @@
 
 namespace cudf::detail {
 
+namespace {
+
+std::mutex stream_provider_mutex;
+stream_provider_fn installed_stream_provider = nullptr;
+
+}  // namespace
+
 // TODO: what is a good number here. what's the penalty for making it larger?
 // Dave Baranec rule of thumb was max_streams_needed * num_concurrent_threads,
 // where num_concurrent_threads was estimated to be 4. so using 32 will allow
@@ -171,9 +178,28 @@ cuda_stream_pool& global_cuda_stream_pool()
   return *pools[device_id.value()];
 }
 
+void install_stream_provider(stream_provider_fn provider)
+{
+  if (provider == nullptr) { throw cudf::logic_error{"stream provider must not be null"}; }
+
+  std::lock_guard<std::mutex> const lock(stream_provider_mutex);
+  if (installed_stream_provider != nullptr && installed_stream_provider != provider) {
+    throw cudf::logic_error{"a different fork-stream provider is already installed"};
+  }
+  installed_stream_provider = provider;
+}
+
 std::vector<rmm::cuda_stream_view> fork_streams(rmm::cuda_stream_view stream, std::size_t count)
 {
-  auto const streams = global_cuda_stream_pool().get_streams(count);
+  stream_provider_fn provider = nullptr;
+  {
+    std::lock_guard<std::mutex> const lock(stream_provider_mutex);
+    provider = installed_stream_provider;
+  }
+
+  auto const streams = provider != nullptr ? provider(stream, count) : global_cuda_stream_pool().get_streams(count);
+  CUDF_EXPECTS(streams.size() == count, "fork-stream provider returned the wrong number of streams");
+  CUDF_EXPECTS(count == 0 || !streams.empty(), "fork-stream provider returned an empty auxiliary set");
   auto const event   = event_for_thread();
   CUDF_CUDA_TRY(cudaEventRecord(event, stream));
   std::for_each(streams.begin(), streams.end(), [&](auto& strm) {

@@ -19,6 +19,16 @@
 namespace CUDF_EXPORT cudf {
 namespace io::parquet::detail {
 
+enum class compact_protocol_reader_test_event {
+  skip_struct_field,
+  struct_list_task_submitted,
+  struct_list_worker_start,
+  struct_list_ranges_destroyed
+};
+using compact_protocol_reader_test_hook = void (*)(compact_protocol_reader_test_event);
+
+void set_compact_protocol_reader_test_hook(compact_protocol_reader_test_hook hook) noexcept;
+
 /**
  * @brief Class for parsing Parquet's Thrift Compact Protocol encoded metadata
  *

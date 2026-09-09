@@ -1050,6 +1050,7 @@ table_with_metadata read_csv(cudf::io::datasource* source,
       };
 
       std::vector<std::future<void>> tasks;
+      cudf::detail::future_drain_guard task_drain{tasks};
       tasks.reserve(num_tasks);
 
       for (size_t task_id = 0; task_id < num_tasks; ++task_id) {
@@ -1064,9 +1065,7 @@ table_with_metadata read_csv(cudf::io::datasource* source,
           }));
       }
 
-      for (auto& task : tasks) {
-        task.get();
-      }
+      cudf::detail::get_all_futures(tasks);
 
       cudf::detail::join_streams(streams, stream);
 

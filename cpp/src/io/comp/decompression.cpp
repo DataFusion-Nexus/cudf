@@ -560,6 +560,7 @@ void host_decompress(compression_type compression,
   stream.synchronize();
 
   std::vector<std::future<size_t>> tasks;
+  cudf::detail::future_drain_guard task_drain{tasks};
   auto const num_streams =
     std::min<std::size_t>(num_chunks, cudf::detail::host_worker_pool().get_thread_count());
   auto const streams = cudf::detail::fork_streams(stream, num_streams);
@@ -579,10 +580,11 @@ void host_decompress(compression_type compression,
     };
     tasks.emplace_back(cudf::detail::host_worker_pool().submit_task(std::move(task)));
   }
-  auto h_results = cudf::detail::make_pinned_vector<codec_exec_result>(num_chunks, stream);
-  for (auto i = 0ul; i < num_chunks; ++i) {
-    h_results[i] = {tasks[i].get(), codec_status::SUCCESS};
-  }
+  auto h_results  = cudf::detail::make_pinned_vector<codec_exec_result>(num_chunks, stream);
+  auto result_idx = 0ul;
+  cudf::detail::get_all_futures(tasks, [&](auto const uncomp_size) {
+    h_results[result_idx++] = {uncomp_size, codec_status::SUCCESS};
+  });
 
   cudf::detail::join_streams(streams, stream);
   cudf::detail::cuda_memcpy<codec_exec_result>(results, h_results, stream);

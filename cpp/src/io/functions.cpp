@@ -169,16 +169,15 @@ std::vector<std::unique_ptr<cudf::io::datasource>> make_datasources(source_info 
         cudf::detail::getenv_or("LIBCUDF_DATASOURCE_PARALLEL_CREATION_THRESHOLD", 8ul);
       if (info.filepath_sources().size() >= pool_use_threshold) {
         std::vector<std::future<std::unique_ptr<cudf::io::datasource>>> source_tasks;
+        cudf::detail::future_drain_guard task_drain{source_tasks};
         source_tasks.reserve(info.filepath_sources().size());
         for (auto const& fs : info.filepath_sources()) {
           source_tasks.emplace_back(cudf::detail::host_worker_pool().submit_task([=] {
             return cudf::io::datasource::create(fs.path, offset, max_size_estimate, fs.size);
           }));
         }
-        std::transform(
-          source_tasks.begin(), source_tasks.end(), std::back_inserter(sources), [](auto& task) {
-            return task.get();
-          });
+        cudf::detail::get_all_futures(
+          source_tasks, [&](auto source) { sources.emplace_back(std::move(source)); });
       } else {
         for (auto const& fs : info.filepath_sources()) {
           sources.emplace_back(

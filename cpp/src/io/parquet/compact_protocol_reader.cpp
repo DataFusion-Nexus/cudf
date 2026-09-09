@@ -12,6 +12,7 @@
 #include <cudf/utilities/span.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <functional>
@@ -20,6 +21,22 @@
 
 namespace cudf::io::parquet::detail {
 namespace {
+
+std::atomic<compact_protocol_reader_test_hook> test_hook{nullptr};
+
+void notify_test_hook(compact_protocol_reader_test_event event)
+{
+  if (auto const hook = test_hook.load(std::memory_order_acquire); hook != nullptr) { hook(event); }
+}
+
+// Reports when the struct-range storage referenced by submitted workers goes out
+// of scope, so a test can observe that the drain guard outlives it.
+struct struct_list_ranges_scope {
+  ~struct_list_ranges_scope()
+  {
+    notify_test_hook(compact_protocol_reader_test_event::struct_list_ranges_destroyed);
+  }
+};
 
 std::string field_type_string(FieldType type)
 {
@@ -103,6 +120,11 @@ inline void function_builder(CompactProtocolReader* cpr, std::tuple<Operator...>
 }
 
 }  // namespace
+
+void set_compact_protocol_reader_test_hook(compact_protocol_reader_test_hook hook) noexcept
+{
+  test_hook.store(hook, std::memory_order_release);
+}
 
 /**
  * @brief Base class for parquet field functors.
@@ -423,11 +445,13 @@ class parquet_field_struct_list : public parquet_field {
       auto const items_per_task = n / num_tasks;
       auto const remainder      = n % num_tasks;
 
-      std::vector<std::future<void>> tasks;
-      tasks.reserve(num_tasks);
-
+      struct_list_ranges_scope ranges_scope;
       std::vector<cudf::host_span<uint8_t const>> all_ranges;
       all_ranges.reserve(n);
+
+      std::vector<std::future<void>> tasks;
+      cudf::detail::future_drain_guard task_drain{tasks};
+      tasks.reserve(num_tasks);
 
       uint32_t struct_idx = 0;
       for (uint32_t task_id = 0; task_id < num_tasks; ++task_id) {
@@ -448,19 +472,19 @@ class parquet_field_struct_list : public parquet_field {
         // the remaining ranges
         tasks.emplace_back(cudf::detail::host_worker_pool().submit_task(
           [&val = this->val, &all_ranges, start_idx, end_idx]() {
+            notify_test_hook(compact_protocol_reader_test_event::struct_list_worker_start);
             CompactProtocolReader local_cpr;
             for (size_t i = start_idx; i < end_idx && i < all_ranges.size(); ++i) {
               local_cpr.init(all_ranges[i].data(), all_ranges[i].size());
               local_cpr.read(&val[i]);
             }
           }));
+        notify_test_hook(compact_protocol_reader_test_event::struct_list_task_submitted);
 
         struct_idx = end_idx;
       }
 
-      for (auto& task : tasks) {
-        task.get();
-      }
+      cudf::detail::get_all_futures(tasks);
     } else {
       // For small numbers of elements, use sequential processing to avoid overhead
       std::for_each(val.begin(), val.end(), [&cpr](auto& elem) { cpr->read(&elem); });
@@ -561,6 +585,7 @@ class parquet_field_optional : public parquet_field {
  */
 void CompactProtocolReader::skip_struct_field(int t, int depth)
 {
+  notify_test_hook(compact_protocol_reader_test_event::skip_struct_field);
   auto const t_enum = static_cast<FieldType>(t);
   switch (t_enum) {
     case FieldType::BOOLEAN_TRUE:

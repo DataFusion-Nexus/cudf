@@ -11,6 +11,7 @@
 #include <cudf/io/config_utils.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/logger.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/span.hpp>
 
@@ -203,7 +204,9 @@ class device_buffer_source final : public datasource {
   size_t host_read(size_t offset, size_t size, uint8_t* dst) override
   {
     auto const count  = std::min(size, this->size() - offset);
-    auto const stream = cudf::detail::global_cuda_stream_pool().get_stream();
+    // The datasource host-read API has no caller stream. Use cuDF's explicit
+    // backend default stream instead of an unowned process-global pool stream.
+    auto const stream = cudf::get_default_stream();
     cudf::detail::cuda_memcpy(host_span<uint8_t>{dst, count},
                               device_span<uint8_t const>{
                                 reinterpret_cast<uint8_t const*>(_d_buffer.data() + offset), count},
@@ -214,7 +217,7 @@ class device_buffer_source final : public datasource {
   std::unique_ptr<buffer> host_read(size_t offset, size_t size) override
   {
     auto const count  = std::min(size, this->size() - offset);
-    auto const stream = cudf::detail::global_cuda_stream_pool().get_stream();
+    auto const stream = cudf::get_default_stream();
     auto h_data       = cudf::detail::make_host_vector_async(
       cudf::device_span<std::byte const>{_d_buffer.data() + offset, count}, stream);
     stream.synchronize();

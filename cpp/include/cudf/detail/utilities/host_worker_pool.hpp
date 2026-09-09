@@ -12,7 +12,13 @@
 #include <BS_thread_pool.hpp>
 
 #include <cstddef>
+#include <exception>
+#include <functional>
+#include <future>
 #include <memory>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace cudf::detail {
 
@@ -90,6 +96,88 @@ class CUDF_EXPORT hierarchical_thread_pool {
    */
   [[nodiscard]] std::size_t get_thread_count() const { return pool_.get_thread_count(); }
 };
+
+/**
+ * @brief Drain every valid future, retaining no exception from cleanup.
+ */
+template <typename T>
+void drain_futures(std::vector<std::future<T>>& futures) noexcept
+{
+  for (auto& future : futures) {
+    try {
+      if (future.valid()) { future.get(); }
+    } catch (...) {
+      // A caller that has a primary failure must not lose it to cleanup.
+    }
+  }
+}
+
+/**
+ * @brief Keep submitted host tasks alive through scope unwinding.
+ *
+ * This guard covers failures while submitting tasks as well as failures while collecting them.
+ */
+template <typename T>
+class future_drain_guard {
+  std::vector<std::future<T>>& futures_;
+
+ public:
+  explicit future_drain_guard(std::vector<std::future<T>>& futures) noexcept : futures_{futures} {}
+
+  future_drain_guard(future_drain_guard const&)            = delete;
+  future_drain_guard& operator=(future_drain_guard const&) = delete;
+
+  ~future_drain_guard() noexcept { drain_futures(futures_); }
+};
+
+/**
+ * @brief Collect a group of host tasks while draining work after a failure.
+ *
+ * Results are consumed in submission order. If a future or the result consumer throws, all
+ * remaining submitted futures are still retrieved before the first exception is rethrown. A
+ * drain exception is cleanup state and is intentionally ignored so it cannot replace the primary
+ * failure payload.
+ *
+ * @tparam T Future result type.
+ * @tparam Consumer Callable receiving each result, or no argument for `void` futures.
+ * @param futures Futures returned by a host worker pool.
+ * @param consumer Callable invoked for successfully retrieved results.
+ */
+template <typename T, typename Consumer>
+void get_all_futures(std::vector<std::future<T>>& futures, Consumer&& consumer)
+{
+  std::exception_ptr primary_failure;
+  auto next = futures.begin();
+
+  while (next != futures.end()) {
+    auto current = next++;
+    try {
+      if constexpr (std::is_void_v<T>) {
+        current->get();
+        std::invoke(consumer);
+      } else {
+        std::invoke(consumer, current->get());
+      }
+    } catch (...) {
+      primary_failure = std::current_exception();
+      break;
+    }
+  }
+
+  // Keep every worker-referenced object alive until every submitted task has completed.
+  drain_futures(futures);
+
+  if (primary_failure) { std::rethrow_exception(primary_failure); }
+}
+
+/**
+ * @brief Collect host task futures when their results are not needed.
+ */
+template <typename T>
+void get_all_futures(std::vector<std::future<T>>& futures)
+{
+  get_all_futures(futures, [](auto&&...) {});
+}
 
 /**
  * @brief Retrieves the appropriate thread pool based on the calling thread's context.
