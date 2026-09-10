@@ -50,62 +50,6 @@ enum class negative_index_policy : bool {
 };
 
 /**
- * @brief Metadata for one flat fixed-width column in a DONT_CHECK gather.
- *
- * `num_children` is used to reject nested columns before sizing. It is not a
- * nested-column sizing contract.
- */
-struct gather_fixed_width_column_metadata {
-  data_type type;
-  bool nullable{false};
-  std::int32_t num_children{0};
-};
-
-/**
- * @brief Allocation components for the flat fixed-width DONT_CHECK gather path.
- *
- * The output and temporary fields are requested bytes. The active phase peak
- * is their checked sum, excluding the source table, which remains live across
- * the gather.
- */
-struct gather_fixed_width_dont_check_preflight_result {
-  std::size_t gather_map_bytes{0};
-  std::size_t output_data_bytes{0};
-  std::size_t output_null_mask_bytes{0};
-  std::size_t target_mask_pointer_array_bytes{0};
-  std::size_t source_table_device_view_bytes{0};
-  std::size_t valid_count_array_bytes{0};
-  std::size_t native_temporary_workspace_bytes{0};
-  std::size_t active_phase_peak_bytes{0};
-};
-
-/**
- * @brief Query the owner allocation shape for a flat DONT_CHECK gather.
- *
- * No stream, memory resource, column, or device allocation is required. The
- * metadata must describe only top-level fixed-width non-decimal or string
- * columns with no children. String columns require a hard output-data upper
- * bound; fixed-width columns require the exact output-data byte count.
- *
- * @throws cudf::logic_error when the shape is unsupported or a checked byte
- * calculation overflows.
- */
-CUDF_EXPORT gather_fixed_width_dont_check_preflight_result gather_fixed_width_dont_check_preflight(
-  std::int64_t output_rows,
-  std::vector<gather_fixed_width_column_metadata> const& source_columns,
-  std::size_t output_data_bytes_upper_bound,
-  std::int32_t device);
-
-/**
- * @brief Query the owner allocation shape for a table-view DONT_CHECK gather.
- *
- * This overload extracts the flat source-column metadata and delegates to the
- * metadata-only owner contract.
- */
-CUDF_EXPORT gather_fixed_width_dont_check_preflight_result gather_fixed_width_dont_check_preflight(
-  table_view const& source_table, std::int64_t output_rows, std::int32_t device);
-
-/**
  * @brief Gathers the specified rows (including null values) of a set of columns.
  *
  * @ingroup copy_gather

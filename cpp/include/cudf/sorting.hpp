@@ -23,59 +23,6 @@
 namespace CUDF_EXPORT cudf {
 
 /**
- * @brief Allocation components for the unstable single-key radix sorted-order
- * dispatch.
- *
- * The six fields describe the exclusive requested-byte allocations owned by
- * the dispatch. The active phase peak is their checked sum while CUB writes
- * the retained permutation.
- */
-struct sorted_order_radix_preflight_result {
-  std::size_t key_input_bytes{0};
-  std::size_t key_output_bytes{0};
-  std::size_t sequence_bytes{0};
-  std::size_t temporary_workspace_bytes{0};
-  std::size_t retained_order_bytes{0};
-  std::size_t active_phase_peak_bytes{0};
-};
-
-struct sorted_order_lexicographic_preflight_result {
-  std::size_t comparator_state_bytes{0};
-  std::size_t temporary_workspace_bytes{0};
-  std::size_t retained_order_bytes{0};
-  std::size_t active_phase_peak_bytes{0};
-};
-
-/**
- * @brief Query the owner allocation shape for the unstable one-key radix path.
- *
- * The query accepts only non-null integral/chrono or floating-point keys and
- * performs the same CUB null-storage query used by `detail::sorted_order_radix`.
- * `device` is explicit; the caller's current CUDA device is restored before
- * return.
- *
- * @throws cudf::logic_error when the shape is unsupported or a checked byte
- * calculation overflows.
- */
-CUDF_EXPORT sorted_order_radix_preflight_result
-sorted_order_radix_preflight(std::int64_t num_rows,
-                             data_type key_type,
-                             std::int64_t null_count,
-                             std::int32_t key_count,
-                             bool stable,
-                             order key_order,
-                             std::int32_t device);
-
-CUDF_EXPORT sorted_order_lexicographic_preflight_result
-sorted_order_lexicographic_preflight(std::int64_t num_rows,
-                                     std::vector<data_type> const& key_types,
-                                     std::vector<std::int64_t> const& null_counts,
-                                     bool stable,
-                                     std::vector<order> const& key_orders,
-                                     std::vector<null_order> const& null_precedence,
-                                     std::int32_t device);
-
-/**
  * @addtogroup column_sort
  * @{
  */

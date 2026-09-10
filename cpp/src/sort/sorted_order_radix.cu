@@ -233,93 +233,6 @@ struct sorted_order_radix_fn {
   }
 };
 
-std::size_t checked_byte_sum(std::size_t lhs, std::size_t rhs, char const* message)
-{
-  CUDF_EXPECTS(lhs <= std::numeric_limits<std::size_t>::max() - rhs, message);
-  return lhs + rhs;
-}
-
-struct sorted_order_radix_preflight_fn {
-  size_type num_rows;
-  bool ascending;
-  sorted_order_radix_preflight_result result;
-
-  template <typename T>
-  sorted_order_radix_preflight_result operator()()
-  {
-    if constexpr (cudf::is_chrono<T>()) {
-      using rep_type = typename T::rep;
-      fill<rep_type>();
-    } else if constexpr (cudf::is_integral_not_bool<T>()) {
-      fill<T>();
-    } else if constexpr (cudf::is_floating_point<T>()) {
-      fill<T>();
-    } else {
-      CUDF_UNREACHABLE("invalid type for sorted-order radix preflight");
-    }
-    return result;
-  }
-
- private:
-  template <typename T>
-  void fill()
-  {
-    auto const row_count = static_cast<std::size_t>(num_rows);
-    auto const key_bytes =
-      row_count * sizeof(std::conditional_t<cudf::is_floating_point<T>(), float_pair<T>, T>);
-    result.key_input_bytes  = cudf::is_floating_point<T>() ? key_bytes : 0;
-    result.key_output_bytes = key_bytes;
-    result.sequence_bytes   = row_count * sizeof(size_type);
-    auto const stream       = cudf::get_default_stream().value();
-    if constexpr (cudf::is_floating_point<T>()) {
-      result.temporary_workspace_bytes = radix_sort_float_pairs_temp_bytes<T>(
-        nullptr, nullptr, nullptr, nullptr, num_rows, ascending, stream);
-    } else {
-      result.temporary_workspace_bytes = radix_sort_pairs_temp_bytes<T>(
-        nullptr, nullptr, nullptr, nullptr, num_rows, ascending, stream);
-    }
-    result.retained_order_bytes    = result.sequence_bytes;
-    result.active_phase_peak_bytes = checked_byte_sum(
-      result.key_input_bytes, result.key_output_bytes, "sorted-order radix byte count overflowed");
-    result.active_phase_peak_bytes = checked_byte_sum(result.active_phase_peak_bytes,
-                                                      result.sequence_bytes,
-                                                      "sorted-order radix byte count overflowed");
-    result.active_phase_peak_bytes = checked_byte_sum(result.active_phase_peak_bytes,
-                                                      result.temporary_workspace_bytes,
-                                                      "sorted-order radix byte count overflowed");
-    result.active_phase_peak_bytes = checked_byte_sum(result.active_phase_peak_bytes,
-                                                      result.retained_order_bytes,
-                                                      "sorted-order radix byte count overflowed");
-  }
-};
-
-sorted_order_radix_preflight_result sorted_order_radix_preflight_impl(std::int64_t num_rows,
-                                                                      data_type key_type,
-                                                                      std::int64_t null_count,
-                                                                      std::int32_t key_count,
-                                                                      bool stable,
-                                                                      order key_order,
-                                                                      std::int32_t device)
-{
-  CUDF_EXPECTS(num_rows >= 0, "sorted-order radix preflight rows must be non-negative");
-  CUDF_EXPECTS(num_rows <= std::numeric_limits<size_type>::max(),
-               "sorted-order radix preflight rows exceed cudf::size_type");
-  CUDF_EXPECTS(null_count == 0, "sorted-order radix preflight requires a non-null key");
-  CUDF_EXPECTS(key_count == 1, "sorted-order radix preflight requires exactly one key");
-  CUDF_EXPECTS(!stable, "sorted-order radix preflight supports only unstable sorting");
-  CUDF_EXPECTS(key_order == order::ASCENDING || key_order == order::DESCENDING,
-               "sorted-order radix preflight received an invalid key order");
-  CUDF_EXPECTS(device >= 0, "sorted-order radix preflight device must be non-negative");
-  CUDF_EXPECTS(cudf::is_integral_not_bool(key_type) || cudf::is_chrono(key_type) ||
-                 cudf::is_floating_point(key_type),
-               "sorted-order radix preflight key type is unsupported");
-  if (num_rows == 0) { return {}; }
-
-  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device}};
-  sorted_order_radix_preflight_fn fn{static_cast<size_type>(num_rows),
-                                     key_order == order::ASCENDING};
-  return cudf::type_dispatcher<dispatch_storage_type>(key_type, fn);
-}
 }  // namespace
 
 /**
@@ -341,16 +254,4 @@ void sorted_order_radix(column_view const& input,
     input.type(), sorted_order_radix_fn{input, indices, ascending, stream});
 }
 }  // namespace detail
-
-sorted_order_radix_preflight_result sorted_order_radix_preflight(std::int64_t num_rows,
-                                                                 data_type key_type,
-                                                                 std::int64_t null_count,
-                                                                 std::int32_t key_count,
-                                                                 bool stable,
-                                                                 order key_order,
-                                                                 std::int32_t device)
-{
-  return detail::sorted_order_radix_preflight_impl(
-    num_rows, key_type, null_count, key_count, stable, key_order, device);
-}
 }  // namespace cudf
